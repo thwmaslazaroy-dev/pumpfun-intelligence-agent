@@ -1,0 +1,60 @@
+{
+  "name": "pumpfun-intelligence-agent",
+  "version": "0.1.0",
+  "description": "Crypto Launch Intelligence Agent for Pump.fun token launches. Detection, risk scoring, and Telegram alerts. Not a trading bot.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "validate:step3": "ts-node src/__tests__/risk-scoring.validate.ts",
+    "listen:pumpfun:logs": "node dist/scripts/listen-pumpfun-logs.js",
+    "fetch:pumpfun:txs": "node dist/scripts/fetch-pumpfun-recent-transactions.js",
+    "parse:pumpfun:txs": "node dist/scripts/parse-pumpfun-transactions.js",
+    "find:pumpfun:creates": "node dist/scripts/find-pumpfun-create-transactions.js",
+    "diagnose:pumpfun:unknown": "node dist/scripts/diagnose-pumpfun-unknown.js",
+    "test:moralis:token": "node dist/scripts/test-moralis-token-enrichment.js",
+    "track:token:outcome": "node dist/scripts/track-token-outcome.js",
+    "analyze:token:outcomes": "node dist/scripts/analyze-token-outcomes.js",
+    "track:batch:outcomes": "node dist/scripts/track-batch-token-outcomes.js",
+    "analyze:batch:outcomes": "node dist/scripts/analyze-batch-token-outcomes.js",
+    "cleanup:invalid:outcomes": "node dist/scripts/cleanup-invalid-outcomes.js",
+    "analyze:outcome:performance": "node dist/scripts/analyze-outcome-performance.js",
+    "analyze:creator:outcomes": "node dist/scripts/analyze-creator-outcomes.js",
+    "preview:outcome:alerts": "node dist/scripts/preview-outcome-based-alerts.js",
+    "preview:high-confidence:alerts": "node dist/scripts/preview-high-confidence-alerts.js",
+    "preview:delayed:alerts": "node dist/scripts/preview-delayed-alerts.js",
+    "live:detect:creates": "node dist/scripts/live-detect-pumpfun-creates.js",
+    "analyze:live:creates": "node dist/scripts/analyze-live-creates.js",
+    "analyze:live:db": "node dist/scripts/analyze-live-ingestion-db.js",
+    "generate:live:watchlist": "node dist/scripts/generate-live-watchlist.js",
+    "radar:scan": "tsx src/scripts/radar-scan-pumpfun-creates.ts",
+    "generate:budgeted:watchlist": "tsx src/scripts/generate-budgeted-watchlist.ts",
+    "preview:budgeted:watchlist": "tsx src/scripts/preview-budgeted-watchlist.ts",
+    "send:discord:high-confidence": "tsx src/scripts/send-discord-high-confidence-alerts.ts",
+    "radar:loop": "powershell -ExecutionPolicy Bypass -File scripts/radar-loop.ps1"
+  },
+  "keywords": [
+    "pumpfun",
+    "solana",
+    "intelligence",
+    "telegram",
+    "alerts"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.18.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.4.0"
+  }
+}
