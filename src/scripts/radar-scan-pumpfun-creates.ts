@@ -135,6 +135,83 @@ function isLimitErrorCode(code: number | undefined): boolean {
   return code === 429 || code === -32005;
 }
 
+// True for errors that warrant retrying with the backup RPC: 429 status,
+// timeout/abort, and connection-level failures.
+function isRetryableError(msg: string, code?: number): boolean {
+  if (code !== undefined && isLimitErrorCode(code)) return true;
+  return (
+    /HTTP\s*429/i.test(msg) ||
+    /too many requests/i.test(msg) ||
+    /rate[-_\s]?limit/i.test(msg) ||
+    /\b429\b/.test(msg) ||
+    /aborted/i.test(msg) ||
+    /timed?\s*out/i.test(msg) ||
+    /ECONNREFUSED/.test(msg) ||
+    /ENOTFOUND/.test(msg) ||
+    /fetch failed/i.test(msg) ||
+    /socket hang up/i.test(msg) ||
+    /network error/i.test(msg)
+  );
+}
+
+async function rpcWithFallback<T>(
+  primary: string,
+  backup: string | null,
+  method: string,
+  params: unknown,
+): Promise<JsonRpcResponse<T>> {
+  let primaryThrown: unknown = null;
+
+  try {
+    const res = await rpc<T>(primary, method, params);
+    const bodyRetryable =
+      backup &&
+      res.error &&
+      isRetryableError(res.error.message ?? "", res.error.code);
+    if (!bodyRetryable) {
+      return res;
+    }
+    primaryThrown = new Error(res.error!.message);
+    logger.warn("rpc primary body error, retrying with backup", {
+      rpcProvider: "primary",
+      method,
+      fallbackUsed: true,
+      fallbackReason: res.error!.message,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!backup || !isRetryableError(msg)) {
+      throw err;
+    }
+    primaryThrown = err;
+    logger.warn("rpc primary failed, retrying with backup", {
+      rpcProvider: "primary",
+      method,
+      fallbackUsed: true,
+      fallbackReason: msg,
+    });
+  }
+
+  try {
+    const res = await rpc<T>(backup!, method, params);
+    logger.info("rpc backup succeeded", {
+      rpcProvider: "backup",
+      method,
+      fallbackUsed: true,
+    });
+    return res;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error("rpc backup also failed", {
+      rpcProvider: "backup",
+      method,
+      fallbackUsed: true,
+      error: msg,
+    });
+    throw primaryThrown ?? err;
+  }
+}
+
 const LIMIT_EXIT_CODE = 88;
 
 function sleep(ms: number): Promise<void> {
@@ -228,6 +305,7 @@ async function main(): Promise<void> {
   }
 
   const url = config.solanaRpcHttpUrl;
+  const backupUrl = config.solanaRpcHttpUrlBackup || null;
   const programId = config.pumpfunProgramId;
 
   const seenSignatures = loadSeenSignatures();
@@ -262,7 +340,7 @@ async function main(): Promise<void> {
 
   let signatures: SignatureInfo[];
   try {
-    const sigsRes = await rpc<SignatureInfo[]>(url, "getSignaturesForAddress", [
+    const sigsRes = await rpcWithFallback<SignatureInfo[]>(url, backupUrl, "getSignaturesForAddress", [
       programId,
       { limit: signatureLimit },
     ]);
@@ -304,7 +382,7 @@ async function main(): Promise<void> {
     let txRes: JsonRpcResponse<unknown>;
     try {
       if (txFetchDelayMs > 0) await sleep(txFetchDelayMs);
-      txRes = await rpc<unknown>(url, "getTransaction", [
+      txRes = await rpcWithFallback<unknown>(url, backupUrl, "getTransaction", [
         sig.signature,
         {
           encoding: "jsonParsed",

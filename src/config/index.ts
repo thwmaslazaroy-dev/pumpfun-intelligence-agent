@@ -21,6 +21,7 @@ export interface AppConfig {
   alertExtremeRiskEnabled: boolean;
   solanaRpcWsUrl: string;
   solanaRpcHttpUrl: string;
+  solanaRpcHttpUrlBackup: string;
   pumpfunProgramId: string;
   rawLogMaxEvents: number;
   rawLogOutputPath: string;
@@ -92,6 +93,7 @@ export const config: AppConfig = {
   alertExtremeRiskEnabled: readBool("ALERT_EXTREME_RISK_ENABLED", true),
   solanaRpcWsUrl: read("SOLANA_RPC_WS_URL"),
   solanaRpcHttpUrl: read("SOLANA_RPC_HTTP_URL"),
+  solanaRpcHttpUrlBackup: read("SOLANA_RPC_HTTP_URL_BACKUP"),
   pumpfunProgramId: read("PUMPFUN_PROGRAM_ID"),
   rawLogMaxEvents: readInt("RAW_LOG_MAX_EVENTS", 25),
   rawLogOutputPath: read("RAW_LOG_OUTPUT_PATH", "./data/raw-pumpfun-logs.jsonl"),
