@@ -155,6 +155,13 @@ function readPosInt(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function readNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 function loadSeenSignatures(): Set<string> {
   try {
     if (!fs.existsSync(SEEN_SIGS_PATH)) return new Set();
@@ -204,12 +211,14 @@ interface ScanCounters {
 async function main(): Promise<void> {
   const signatureLimit = readPosInt("RADAR_SIGNATURE_LIMIT", 50);
   const txFetchLimit = readPosInt("RADAR_TX_FETCH_LIMIT", 20);
+  const txFetchDelayMs = readNonNegativeInt("RADAR_TX_FETCH_DELAY_MS", 0);
 
   logSanitizedEnvSummary({
     context: "radar:scan",
     extras: {
       RADAR_SIGNATURE_LIMIT: signatureLimit,
       RADAR_TX_FETCH_LIMIT: txFetchLimit,
+      RADAR_TX_FETCH_DELAY_MS: txFetchDelayMs,
     },
   });
 
@@ -246,6 +255,7 @@ async function main(): Promise<void> {
     programId,
     signatureLimit,
     txFetchLimit,
+    txFetchDelayMs,
     seenSignaturesAtStart: seenAtStart,
     databaseUrl: config.databaseUrl,
   });
@@ -293,6 +303,7 @@ async function main(): Promise<void> {
 
     let txRes: JsonRpcResponse<unknown>;
     try {
+      if (txFetchDelayMs > 0) await sleep(txFetchDelayMs);
       txRes = await rpc<unknown>(url, "getTransaction", [
         sig.signature,
         {
@@ -301,6 +312,7 @@ async function main(): Promise<void> {
           commitment: "confirmed",
         },
       ]);
+      if (txFetchDelayMs > 0) await sleep(txFetchDelayMs);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isLimitErrorText(msg)) {
