@@ -506,15 +506,28 @@ async function main(): Promise<void> {
       counters.rejectedNoParsedInstruction += 1;
     }
     counters.instructionsForPumpfunProgram += countProgramInstructions(result, programId);
-    if (parsed.logMessages.some((m) => /Program log:\s*Instruction:\s*Create/i.test(m))) {
-      counters.createLikeInstructions += 1;
-    }
+    const createLikeLogs = parsed.logMessages.filter((m) =>
+      /Program log:\s*Instruction:\s*Create/i.test(m),
+    );
+    const hasCreateLike = createLikeLogs.length > 0;
+    if (hasCreateLike) counters.createLikeInstructions += 1;
 
     const isCreate =
       parsed.kind === "CREATE" &&
       (parsed.confidence === "HIGH" || parsed.confidence === "MEDIUM");
     if (!isCreate) {
       if (parsed.kind === "UNKNOWN") counters.rejectedUnknownInstructionShape += 1;
+      if (hasCreateLike) {
+        logger.info("diag: createLike tx not classified as CREATE", {
+          sig: sig.signature.slice(0, 16) + "…",
+          kind: parsed.kind,
+          confidence: parsed.confidence,
+          pumpfunSeen: parsed.pumpfunProgramSeen,
+          mints: parsed.candidateMints.length,
+          wallets: parsed.candidateWallets.length,
+          createLogs: createLikeLogs.slice(0, 3),
+        });
+      }
       await sleep(TX_FETCH_DELAY_MS);
       continue;
     }
