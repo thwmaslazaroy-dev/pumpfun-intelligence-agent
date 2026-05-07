@@ -306,3 +306,63 @@ export function scoreCandidate(
 
   return { score, breakdown: parts.join(" ") };
 }
+
+// ── Creator Quality Tiers ─────────────────────────────────────────────────────
+
+export type CreatorTier =
+  | "SPAM_CREATOR"
+  | "DEAD_CREATOR"
+  | "ACTIVE_CREATOR"
+  | "PROMISING_CREATOR"
+  | "UNKNOWN_CREATOR";
+
+export interface CreatorTierResult {
+  tier: CreatorTier;
+  reason: string;
+}
+
+export interface CreatorTierInput {
+  /** All launches in the tokens table for this creator (includes those without outcomes). */
+  launches: number;
+  /** Sum of latestSwapCount across mints that have outcome rows. */
+  totalSwaps: number;
+  /** Sum of pricedObservationCount across mints that have outcome rows. */
+  pricedRows: number;
+  /** Count of this creator's mints with holder_risk_label = EXTREME. */
+  extremeHolderCount: number;
+}
+
+export function computeCreatorTier(input: CreatorTierInput): CreatorTierResult {
+  const { launches: l, totalSwaps: sw, pricedRows: pr, extremeHolderCount: ex } = input;
+
+  // SPAM: many launches, no swap activity at all
+  if (l >= 8 && sw === 0) {
+    return { tier: "SPAM_CREATOR", reason: `launches=${l}>=8 totalSwaps=0` };
+  }
+
+  // DEAD: significant launches, zero price data
+  if (l >= 5 && pr === 0) {
+    return { tier: "DEAD_CREATOR", reason: `launches=${l}>=5 pricedRows=0` };
+  }
+
+  // PROMISING — superset of ACTIVE, check first
+  if (l >= 5 && sw >= 100 && pr >= 2 && ex === 0) {
+    return {
+      tier: "PROMISING_CREATOR",
+      reason: `launches=${l}>=5 totalSwaps=${sw}>=100 pricedRows=${pr}>=2 extreme=0`,
+    };
+  }
+
+  // ACTIVE
+  if (l >= 3 && sw >= 50 && ex === 0) {
+    return {
+      tier: "ACTIVE_CREATOR",
+      reason: `launches=${l}>=3 totalSwaps=${sw}>=50 extreme=0`,
+    };
+  }
+
+  return {
+    tier: "UNKNOWN_CREATOR",
+    reason: `launches=${l} totalSwaps=${sw} pricedRows=${pr} extreme=${ex}`,
+  };
+}

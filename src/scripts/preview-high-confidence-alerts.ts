@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import * as fs from "fs";
 import * as path from "path";
+import { computeCreatorTier, CreatorTierResult } from "../lib/budgeted-watchlist-core";
 
 interface TokenRow {
   mint: string;
@@ -346,6 +347,8 @@ interface PreviewRow {
   negativeOutcomes: number;
   holderRiskLabel: string | null;
   holderRiskReason: string | null;
+  creatorTier: string;
+  creatorTierReason: string;
 }
 
 function decisionRank(d: Decision): number {
@@ -463,6 +466,8 @@ function main(): void {
       swapDeltaSum: number;
       swapDeltaCount: number;
       labelCounts: Record<string, number>;
+      totalSwaps: number;
+      pricedRows: number;
     }
 
     const byCreator = new Map<string, CreatorAgg>();
@@ -477,6 +482,8 @@ function main(): void {
           swapDeltaSum: 0,
           swapDeltaCount: 0,
           labelCounts: {},
+          totalSwaps: 0,
+          pricedRows: 0,
         };
         byCreator.set(m.creatorWallet, agg);
       }
@@ -491,6 +498,8 @@ function main(): void {
       }
       agg.labelCounts[m.outcomeLabel] =
         (agg.labelCounts[m.outcomeLabel] ?? 0) + 1;
+      agg.totalSwaps += m.latestSwapCount ?? 0;
+      agg.pricedRows += m.pricedObservationCount;
     }
 
     const creatorRowByWallet = new Map<string, CreatorRow>();
@@ -515,6 +524,50 @@ function main(): void {
       };
       row.creatorOutcomeLabel = classifyCreator(row);
       creatorRowByWallet.set(row.creatorWallet, row);
+    }
+
+    // Total launch count per creator (includes tokens without any outcome rows)
+    const launchCountByCreator = new Map<string, number>();
+    try {
+      const lcRows = db
+        .prepare(
+          "SELECT creator_wallet, COUNT(*) as cnt FROM tokens GROUP BY creator_wallet",
+        )
+        .all() as { creator_wallet: string; cnt: number }[];
+      for (const r of lcRows) launchCountByCreator.set(r.creator_wallet, r.cnt);
+    } catch {
+      // tokens table always exists — this catch is a safeguard only
+    }
+
+    // Extreme holder count per creator
+    const extremeCountByCreator = new Map<string, number>();
+    try {
+      const exRows = db
+        .prepare(
+          `SELECT t.creator_wallet, COUNT(*) as cnt
+           FROM holder_risk_evaluations h
+           JOIN tokens t ON t.mint = h.mint
+           WHERE h.holder_risk_label = 'EXTREME'
+           GROUP BY t.creator_wallet`,
+        )
+        .all() as { creator_wallet: string; cnt: number }[];
+      for (const r of exRows) extremeCountByCreator.set(r.creator_wallet, r.cnt);
+    } catch {
+      // holder_risk_evaluations may not exist yet — no EXTREME data
+    }
+
+    // Build creator tier map
+    const creatorTierByWallet = new Map<string, CreatorTierResult>();
+    for (const agg of byCreator.values()) {
+      creatorTierByWallet.set(
+        agg.creatorWallet,
+        computeCreatorTier({
+          launches: launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked,
+          totalSwaps: agg.totalSwaps,
+          pricedRows: agg.pricedRows,
+          extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
+        }),
+      );
     }
 
     const recentTokens = db
@@ -549,6 +602,16 @@ function main(): void {
         reason = `holder risk ${holderRiskLabel} blocks alert: ${holderRiskReason ?? "see evaluate:holder-risk"}`;
       }
 
+      // Creator tier — hard-reject SPAM and DEAD regardless of earlier decision
+      const tierResult = creatorTierByWallet.get(t.creator_wallet) ?? {
+        tier: "UNKNOWN_CREATOR" as const,
+        reason: "no outcome data for this creator",
+      };
+      if (tierResult.tier === "SPAM_CREATOR" || tierResult.tier === "DEAD_CREATOR") {
+        decision = "REJECT";
+        reason = `creatorTier=${tierResult.tier}: ${tierResult.reason}`;
+      }
+
       previews.push({
         token: t,
         tokenLabel,
@@ -564,6 +627,8 @@ function main(): void {
         negativeOutcomes: score.negativeOutcomes,
         holderRiskLabel,
         holderRiskReason,
+        creatorTier: tierResult.tier,
+        creatorTierReason: tierResult.reason,
       });
     }
 
@@ -656,6 +721,9 @@ function main(): void {
         `      holderRisk=${p.holderRiskLabel ?? "n/a"}  holderRiskReason=${p.holderRiskReason ?? "n/a"}\n`,
       );
       process.stdout.write(
+        `      creatorTier=${p.creatorTier}  creatorTierReason=${p.creatorTierReason}\n`,
+      );
+      process.stdout.write(
         `      finalDecision=${p.decision}  reason=${p.reason}\n`,
       );
       idx++;
@@ -682,6 +750,8 @@ function main(): void {
       negativeOutcomes: p.negativeOutcomes,
       holderRiskLabel: p.holderRiskLabel,
       holderRiskReason: p.holderRiskReason,
+      creatorTier: p.creatorTier,
+      creatorTierReason: p.creatorTierReason,
     }));
     const outPath = path.resolve(
       process.cwd(),

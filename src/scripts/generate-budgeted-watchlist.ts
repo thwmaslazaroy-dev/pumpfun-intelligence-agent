@@ -5,9 +5,11 @@ import {
   BudgetedRejectionReason,
   Candidate,
   CreatorRow,
+  CreatorTierResult,
   JoinRow,
   MintMetrics,
   classifyCreator,
+  computeCreatorTier,
   computeMintMetrics,
   evaluateBudgetedReject,
   scoreCandidate,
@@ -128,6 +130,8 @@ function main(): void {
       gainSum: number;
       gainCount: number;
       labelCounts: Record<string, number>;
+      totalSwaps: number;
+      pricedRows: number;
     }
     const byCreator = new Map<string, CreatorAgg>();
     for (const m of mintMetricsByMint.values()) {
@@ -139,6 +143,8 @@ function main(): void {
           gainSum: 0,
           gainCount: 0,
           labelCounts: {},
+          totalSwaps: 0,
+          pricedRows: 0,
         };
         byCreator.set(m.creatorWallet, agg);
       }
@@ -148,6 +154,8 @@ function main(): void {
         agg.gainCount += 1;
       }
       agg.labelCounts[m.outcomeLabel] = (agg.labelCounts[m.outcomeLabel] ?? 0) + 1;
+      agg.totalSwaps += m.latestSwapCount ?? 0;
+      agg.pricedRows += m.pricedObservationCount;
     }
 
     const creatorRowByWallet = new Map<string, CreatorRow>();
@@ -170,6 +178,50 @@ function main(): void {
       creatorRowByWallet.set(row.creatorWallet, row);
     }
 
+    // Total launch count per creator (includes mints without any outcome rows)
+    const launchCountRows = db
+      .prepare(
+        "SELECT creator_wallet, COUNT(*) as cnt FROM tokens GROUP BY creator_wallet",
+      )
+      .all() as { creator_wallet: string; cnt: number }[];
+    const launchCountByCreator = new Map<string, number>();
+    for (const r of launchCountRows) {
+      launchCountByCreator.set(r.creator_wallet, r.cnt);
+    }
+
+    // Extreme holder count per creator (table may not exist yet — degrade gracefully)
+    const extremeCountByCreator = new Map<string, number>();
+    try {
+      const extremeRows = db
+        .prepare(
+          `SELECT t.creator_wallet, COUNT(*) as cnt
+           FROM holder_risk_evaluations h
+           JOIN tokens t ON t.mint = h.mint
+           WHERE h.holder_risk_label = 'EXTREME'
+           GROUP BY t.creator_wallet`,
+        )
+        .all() as { creator_wallet: string; cnt: number }[];
+      for (const r of extremeRows) {
+        extremeCountByCreator.set(r.creator_wallet, r.cnt);
+      }
+    } catch {
+      // holder_risk_evaluations not yet created — no EXTREME data available
+    }
+
+    // Build creator tier map
+    const creatorTierByWallet = new Map<string, CreatorTierResult>();
+    for (const agg of byCreator.values()) {
+      creatorTierByWallet.set(
+        agg.creatorWallet,
+        computeCreatorTier({
+          launches: launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked,
+          totalSwaps: agg.totalSwaps,
+          pricedRows: agg.pricedRows,
+          extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
+        }),
+      );
+    }
+
     const tokens = db
       .prepare(
         `SELECT mint, creator_wallet, launched_at, symbol
@@ -188,9 +240,22 @@ function main(): void {
       creatorMoreBadThanPositive: 0,
       creatorAvgGainNegative: 0,
     };
+    let spamCreatorRejected = 0;
+    let deadCreatorRejected = 0;
 
     const candidates: Candidate[] = [];
     for (const t of tokens) {
+      // Creator tier hard-reject (checked before the standard reject evaluator)
+      const tierResult = creatorTierByWallet.get(t.creator_wallet);
+      if (tierResult?.tier === "SPAM_CREATOR") {
+        spamCreatorRejected += 1;
+        continue;
+      }
+      if (tierResult?.tier === "DEAD_CREATOR") {
+        deadCreatorRejected += 1;
+        continue;
+      }
+
       const cr = creatorRowByWallet.get(t.creator_wallet) ?? null;
       const creatorLabel = cr?.creatorOutcomeLabel ?? "UNKNOWN";
       const tokenLabel = mintMetricsByMint.get(t.mint)?.outcomeLabel ?? null;
@@ -223,7 +288,14 @@ function main(): void {
         positive,
         bad,
       };
-      const { score, breakdown } = scoreCandidate(partial, minLaunches);
+      let { score, breakdown } = scoreCandidate(partial, minLaunches);
+      if (tierResult?.tier === "PROMISING_CREATOR") {
+        score += 20;
+        breakdown += " tier=PROMISING_CREATOR(+20)";
+      } else if (tierResult?.tier === "ACTIVE_CREATOR") {
+        score += 10;
+        breakdown += " tier=ACTIVE_CREATOR(+10)";
+      }
       candidates.push({ ...partial, score, scoreBreakdown: breakdown });
     }
 
@@ -279,6 +351,8 @@ function main(): void {
 
     process.stdout.write("\n--- counts ---\n");
     process.stdout.write(`  tokensConsidered:                  ${tokens.length}\n`);
+    process.stdout.write(`  rejectedSpamCreator:               ${spamCreatorRejected}\n`);
+    process.stdout.write(`  rejectedDeadCreator:               ${deadCreatorRejected}\n`);
     process.stdout.write(`  rejectedSpammyRiskyCreator:        ${rejectCounts.spammyRiskyCreator}\n`);
     process.stdout.write(`  rejectedAlreadyEnoughSnapshots:    ${rejectCounts.alreadyEnoughSnapshots}\n`);
     process.stdout.write(`  rejectedTokenLabelDownOrRug:       ${rejectCounts.tokenLabelDownOrRug}\n`);
