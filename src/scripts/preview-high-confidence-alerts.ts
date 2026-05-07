@@ -174,13 +174,92 @@ function classifyCreator(c: CreatorRow): string {
   return "UNKNOWN";
 }
 
+interface CreatorScoreResult {
+  creatorScore: number;
+  creatorScoreReason: string[];
+  previousLaunches: number;
+  positiveOutcomes: number;
+  negativeOutcomes: number;
+}
+
+function scoreCreator(c: CreatorRow | null): CreatorScoreResult {
+  if (c === null) {
+    return {
+      creatorScore: 0,
+      creatorScoreReason: ["no creator history yet"],
+      previousLaunches: 0,
+      positiveOutcomes: 0,
+      negativeOutcomes: 0,
+    };
+  }
+
+  const reasons: string[] = [];
+  let score = 0;
+
+  const addPoints = (count: number, perPoints: number, label: string): void => {
+    if (count <= 0) return;
+    const pts = count * perPoints;
+    score += pts;
+    const sign = pts >= 0 ? `+${pts}` : `${pts}`;
+    reasons.push(`${label} x${count} (${sign})`);
+  };
+
+  addPoints(c.strongGain, 5, "STRONG_GAIN");
+  addPoints(c.up, 3, "UP");
+  addPoints(c.activeFlat, 1, "ACTIVE_FLAT");
+  addPoints(c.flat, -1, "FLAT");
+  addPoints(c.noPrice, -3, "NO_PRICE");
+  addPoints(c.down, -4, "DOWN");
+  addPoints(c.rugLike, -6, "RUG_LIKE");
+
+  const positiveOutcomes = c.strongGain + c.up + c.activeFlat;
+  const negativeOutcomes = c.flat + c.noPrice + c.down + c.rugLike;
+  const previousLaunches = c.launchesTracked || 0;
+
+  if (
+    previousLaunches >= 5 &&
+    negativeOutcomes / previousLaunches >= 0.7
+  ) {
+    score -= 5;
+    reasons.push("spam penalty: many launches with mostly bad outcomes (-5)");
+  }
+  if (previousLaunches >= 3 && c.noPrice / previousLaunches >= 0.7) {
+    score -= 4;
+    reasons.push("no-price penalty: mostly NO_PRICE outcomes (-4)");
+  }
+
+  if (previousLaunches < 3) {
+    reasons.push(`limited history: launches=${previousLaunches}`);
+  }
+
+  if (reasons.length === 0) {
+    reasons.push("no scored events yet");
+  }
+
+  return {
+    creatorScore: score,
+    creatorScoreReason: reasons,
+    previousLaunches,
+    positiveOutcomes,
+    negativeOutcomes,
+  };
+}
+
 type Decision = "HIGH_PRIORITY_ALERT" | "WATCH_ONLY" | "REJECT";
 
 function decide(
   tokenLabel: string | null,
   creatorRow: CreatorRow | null,
   minLaunches: number,
+  scoreResult: CreatorScoreResult,
 ): { decision: Decision; reason: string } {
+  if (scoreResult.creatorScore <= -8) {
+    return {
+      decision: "REJECT",
+      reason: `rule 9: very negative creatorScore=${scoreResult.creatorScore}`,
+    };
+  }
+
   if (creatorRow === null) {
     return { decision: "REJECT", reason: "rule 1: no creator history" };
   }
@@ -225,11 +304,19 @@ function decide(
   const eligibleByCreator =
     creatorLabel === "PROMISING" || (positive >= 2 && bad <= positive);
   const tokenOk = tokenLabel === null || OK_CURRENT_TOKEN_LABELS.has(tokenLabel);
+  const tokenStrictOk =
+    tokenLabel !== null && OK_CURRENT_TOKEN_LABELS.has(tokenLabel);
 
   if (eligibleByCreator && tokenOk) {
+    if (scoreResult.creatorScore >= 8 && tokenStrictOk) {
+      return {
+        decision: "HIGH_PRIORITY_ALERT",
+        reason: `rule 6: creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"} creatorScore=${scoreResult.creatorScore}`,
+      };
+    }
     return {
-      decision: "HIGH_PRIORITY_ALERT",
-      reason: `rule 6: creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"}`,
+      decision: "WATCH_ONLY",
+      reason: `rule 6b: high-priority gate not met (creatorScore=${scoreResult.creatorScore}, tokenLabel=${tokenLabel ?? "n/a"}); held at watch-only`,
     };
   }
 
@@ -247,6 +334,11 @@ interface PreviewRow {
   reason: string;
   positive: number;
   bad: number;
+  creatorScore: number;
+  creatorScoreReason: string[];
+  previousLaunches: number;
+  positiveOutcomes: number;
+  negativeOutcomes: number;
 }
 
 function decisionRank(d: Decision): number {
@@ -416,7 +508,8 @@ function main(): void {
       const cr = creatorRowByWallet.get(t.creator_wallet) ?? null;
       const positive = cr ? cr.strongGain + cr.up + cr.activeFlat : 0;
       const bad = cr ? cr.flat + cr.noPrice + cr.down + cr.rugLike : 0;
-      const { decision, reason } = decide(tokenLabel, cr, minLaunches);
+      const score = scoreCreator(cr);
+      const { decision, reason } = decide(tokenLabel, cr, minLaunches, score);
       previews.push({
         token: t,
         tokenLabel,
@@ -425,6 +518,11 @@ function main(): void {
         reason,
         positive,
         bad,
+        creatorScore: score.creatorScore,
+        creatorScoreReason: score.creatorScoreReason,
+        previousLaunches: score.previousLaunches,
+        positiveOutcomes: score.positiveOutcomes,
+        negativeOutcomes: score.negativeOutcomes,
       });
     }
 
@@ -508,7 +606,13 @@ function main(): void {
         `      avgCreatorGain=${avgGain}  positive(STRG/UP/ACTV)=${strg}/${up}/${actv}  bad(FLAT/NOPX/DOWN/RUG)=${flat}/${nopx}/${down}/${rug}\n`,
       );
       process.stdout.write(
-        `      decision=${p.decision}  reason=${p.reason}\n`,
+        `      creatorScore=${p.creatorScore}  previousLaunches=${p.previousLaunches}  positiveOutcomes=${p.positiveOutcomes}  negativeOutcomes=${p.negativeOutcomes}\n`,
+      );
+      process.stdout.write(
+        `      creatorScoreReason=${p.creatorScoreReason.join("; ")}\n`,
+      );
+      process.stdout.write(
+        `      finalDecision=${p.decision}  reason=${p.reason}\n`,
       );
       idx++;
     }
@@ -519,6 +623,7 @@ function main(): void {
       symbol: p.token.symbol,
       launchedAtIso: new Date(p.token.launched_at).toISOString(),
       decision: p.decision,
+      finalDecision: p.decision,
       reason: p.reason,
       tracked: p.creatorRow?.launchesTracked ?? 0,
       creatorLabel: p.creatorRow?.creatorOutcomeLabel ?? "UNKNOWN",
@@ -526,6 +631,11 @@ function main(): void {
       avgGainPercent: p.creatorRow?.avgGainPercent ?? null,
       positive: p.positive,
       bad: p.bad,
+      creatorScore: p.creatorScore,
+      creatorScoreReason: p.creatorScoreReason,
+      previousLaunches: p.previousLaunches,
+      positiveOutcomes: p.positiveOutcomes,
+      negativeOutcomes: p.negativeOutcomes,
     }));
     const outPath = path.resolve(
       process.cwd(),
