@@ -35,7 +35,8 @@
     "send:discord:high-confidence": "tsx src/scripts/send-discord-high-confidence-alerts.ts",
     "radar:loop": "powershell -ExecutionPolicy Bypass -File scripts/radar-loop.ps1",
     "probe:pumpfun:feed": "tsx src/scripts/probe-pumpfun-created-feed.ts",
-    "radar:fetch:pumpfun:created-feed": "tsx src/scripts/radar-fetch-pumpfun-created-feed.ts"
+    "radar:fetch:pumpfun:created-feed": "tsx src/scripts/radar-fetch-pumpfun-created-feed.ts",
+    "evaluate:holder-risk": "tsx src/scripts/evaluate-holder-risk.ts"
   },
   "keywords": [
     "pumpfun",

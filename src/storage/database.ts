@@ -140,6 +140,16 @@ CREATE TABLE IF NOT EXISTS token_outcomes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_token_outcomes_mint_observed ON token_outcomes(mint, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS holder_risk_evaluations (
+  mint TEXT PRIMARY KEY,
+  holder_risk_label TEXT NOT NULL,
+  holder_risk_reason TEXT NOT NULL,
+  creator_hold_percent REAL,
+  largest_wallet_percent REAL,
+  top10_holder_percent REAL,
+  evaluated_at INTEGER NOT NULL
+);
 `;
 
 let db: Database.Database | null = null;

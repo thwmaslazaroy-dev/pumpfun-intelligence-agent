@@ -326,6 +326,11 @@ function decide(
   };
 }
 
+interface HolderRiskEval {
+  label: string;
+  reason: string;
+}
+
 interface PreviewRow {
   token: TokenRow;
   tokenLabel: string | null;
@@ -339,6 +344,8 @@ interface PreviewRow {
   previousLaunches: number;
   positiveOutcomes: number;
   negativeOutcomes: number;
+  holderRiskLabel: string | null;
+  holderRiskReason: string | null;
 }
 
 function decisionRank(d: Decision): number {
@@ -398,6 +405,24 @@ function main(): void {
       `\nfailed to open SQLite read-only: ${err instanceof Error ? err.message : String(err)}\n`,
     );
     process.exit(1);
+  }
+
+  // Load holder risk evaluations (table may not exist on first run — handle gracefully)
+  const holderRiskByMint = new Map<string, HolderRiskEval>();
+  try {
+    const hrRows = db
+      .prepare(
+        "SELECT mint, holder_risk_label, holder_risk_reason FROM holder_risk_evaluations",
+      )
+      .all() as { mint: string; holder_risk_label: string; holder_risk_reason: string }[];
+    for (const r of hrRows) {
+      holderRiskByMint.set(r.mint, {
+        label: r.holder_risk_label,
+        reason: r.holder_risk_reason,
+      });
+    }
+  } catch {
+    // Table does not exist yet — evaluate:holder-risk has not been run; show n/a for all
   }
 
   try {
@@ -509,7 +534,21 @@ function main(): void {
       const positive = cr ? cr.strongGain + cr.up + cr.activeFlat : 0;
       const bad = cr ? cr.flat + cr.noPrice + cr.down + cr.rugLike : 0;
       const score = scoreCreator(cr);
-      const { decision, reason } = decide(tokenLabel, cr, minLaunches, score);
+      let { decision, reason } = decide(tokenLabel, cr, minLaunches, score);
+
+      const holderRisk = holderRiskByMint.get(t.mint) ?? null;
+      const holderRiskLabel = holderRisk?.label ?? null;
+      const holderRiskReason = holderRisk?.reason ?? null;
+
+      // Block HIGH_PRIORITY_ALERT when holder concentration is HIGH or EXTREME
+      if (
+        decision === "HIGH_PRIORITY_ALERT" &&
+        (holderRiskLabel === "HIGH" || holderRiskLabel === "EXTREME")
+      ) {
+        decision = "WATCH_ONLY";
+        reason = `holder risk ${holderRiskLabel} blocks alert: ${holderRiskReason ?? "see evaluate:holder-risk"}`;
+      }
+
       previews.push({
         token: t,
         tokenLabel,
@@ -523,6 +562,8 @@ function main(): void {
         previousLaunches: score.previousLaunches,
         positiveOutcomes: score.positiveOutcomes,
         negativeOutcomes: score.negativeOutcomes,
+        holderRiskLabel,
+        holderRiskReason,
       });
     }
 
@@ -612,6 +653,9 @@ function main(): void {
         `      creatorScoreReason=${p.creatorScoreReason.join("; ")}\n`,
       );
       process.stdout.write(
+        `      holderRisk=${p.holderRiskLabel ?? "n/a"}  holderRiskReason=${p.holderRiskReason ?? "n/a"}\n`,
+      );
+      process.stdout.write(
         `      finalDecision=${p.decision}  reason=${p.reason}\n`,
       );
       idx++;
@@ -636,6 +680,8 @@ function main(): void {
       previousLaunches: p.previousLaunches,
       positiveOutcomes: p.positiveOutcomes,
       negativeOutcomes: p.negativeOutcomes,
+      holderRiskLabel: p.holderRiskLabel,
+      holderRiskReason: p.holderRiskReason,
     }));
     const outPath = path.resolve(
       process.cwd(),
