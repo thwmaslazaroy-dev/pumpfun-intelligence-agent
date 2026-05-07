@@ -239,6 +239,34 @@ function readNonNegativeInt(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+function hasAnyInstructions(tx: unknown): boolean {
+  if (typeof tx !== "object" || tx === null) return false;
+  const txField = (tx as Record<string, unknown>)["transaction"];
+  if (typeof txField !== "object" || txField === null) return false;
+  const message = (txField as Record<string, unknown>)["message"];
+  if (typeof message !== "object" || message === null) return false;
+  const ixs = (message as Record<string, unknown>)["instructions"];
+  return Array.isArray(ixs) && ixs.length > 0;
+}
+
+function countProgramInstructions(tx: unknown, pid: string): number {
+  let n = 0;
+  if (typeof tx !== "object" || tx === null) return 0;
+  const txObj = tx as Record<string, unknown>;
+  const msg = ((txObj["transaction"] as Record<string, unknown> | null)?.["message"]) as Record<string, unknown> | null;
+  for (const ix of (Array.isArray(msg?.["instructions"]) ? (msg!["instructions"] as unknown[]) : [])) {
+    if ((ix as Record<string, unknown>)?.["programId"] === pid) n++;
+  }
+  const meta = txObj["meta"] as Record<string, unknown> | null;
+  for (const grp of (Array.isArray(meta?.["innerInstructions"]) ? (meta!["innerInstructions"] as unknown[]) : [])) {
+    const ixs = (grp as Record<string, unknown>)?.["instructions"];
+    for (const ix of (Array.isArray(ixs) ? (ixs as unknown[]) : [])) {
+      if ((ix as Record<string, unknown>)?.["programId"] === pid) n++;
+    }
+  }
+  return n;
+}
+
 function loadSeenSignatures(): Set<string> {
   try {
     if (!fs.existsSync(SEEN_SIGS_PATH)) return new Set();
@@ -283,6 +311,15 @@ interface ScanCounters {
   // When > 0, the script exits with LIMIT_EXIT_CODE (88) so the radar loop stops.
   limitHits: number;
   nullTransactions: number;
+  // Diagnostic funnel — why transactions did not become candidates
+  transactionsWithInstructions: number;
+  transactionsMentioningPumpfunProgram: number;
+  instructionsForPumpfunProgram: number;
+  createLikeInstructions: number;
+  rejectedNoParsedInstruction: number;
+  rejectedUnknownInstructionShape: number;
+  rejectedNoMint: number;
+  rejectedNoCreator: number;
 }
 
 async function main(): Promise<void> {
@@ -326,6 +363,14 @@ async function main(): Promise<void> {
     parseErrors: 0,
     limitHits: 0,
     nullTransactions: 0,
+    transactionsWithInstructions: 0,
+    transactionsMentioningPumpfunProgram: 0,
+    instructionsForPumpfunProgram: 0,
+    createLikeInstructions: 0,
+    rejectedNoParsedInstruction: 0,
+    rejectedUnknownInstructionShape: 0,
+    rejectedNoMint: 0,
+    rejectedNoCreator: 0,
   };
 
   logger.info("radar:scan starting (HTTP-only, low-request)", {
@@ -453,10 +498,23 @@ async function main(): Promise<void> {
       continue;
     }
 
+    // Diagnostic funnel
+    if (hasAnyInstructions(result)) counters.transactionsWithInstructions += 1;
+    if (parsed.pumpfunProgramSeen) {
+      counters.transactionsMentioningPumpfunProgram += 1;
+    } else {
+      counters.rejectedNoParsedInstruction += 1;
+    }
+    counters.instructionsForPumpfunProgram += countProgramInstructions(result, programId);
+    if (parsed.logMessages.some((m) => /Program log:\s*Instruction:\s*Create/i.test(m))) {
+      counters.createLikeInstructions += 1;
+    }
+
     const isCreate =
       parsed.kind === "CREATE" &&
       (parsed.confidence === "HIGH" || parsed.confidence === "MEDIUM");
     if (!isCreate) {
+      if (parsed.kind === "UNKNOWN") counters.rejectedUnknownInstructionShape += 1;
       await sleep(TX_FETCH_DELAY_MS);
       continue;
     }
@@ -465,6 +523,7 @@ async function main(): Promise<void> {
 
     const mint = parsed.candidateMints[0];
     if (!mint) {
+      counters.rejectedNoMint += 1;
       logger.info("CREATE detected without candidateMint — skipping save", {
         signature: parsed.signature,
         confidence: parsed.confidence,
@@ -479,6 +538,7 @@ async function main(): Promise<void> {
       programId,
     );
     if (!creatorWallet) {
+      counters.rejectedNoCreator += 1;
       logger.info("CREATE detected without resolvable creator wallet — skipping", {
         signature: parsed.signature,
         candidateWallets: parsed.candidateWallets,
@@ -549,20 +609,27 @@ function endWith(counters: ScanCounters, seen: Set<string>): never {
   logger.info("radar:scan finished", { counters });
 
   process.stdout.write("\n=== radar:scan summary ===\n");
-  process.stdout.write(`  signaturesFetched:           ${counters.signaturesFetched}\n`);
-  process.stdout.write(`  candidatesFound:             ${counters.candidatesFound}\n`);
-  process.stdout.write(`  transactionsFetched:         ${counters.transactionsFetched}\n`);
-  process.stdout.write(`  newLaunchesSaved:            ${counters.newLaunchesSaved}\n`);
-  process.stdout.write(
-    `  duplicateSignaturesSkipped:  ${counters.duplicateSignaturesSkipped}\n`,
-  );
-  process.stdout.write(
-    `  duplicateMintsSkipped:       ${counters.duplicateMintsSkipped}\n`,
-  );
-  process.stdout.write(`  nullTransactions:            ${counters.nullTransactions}\n`);
-  process.stdout.write(`  rpcErrors:                   ${counters.rpcErrors}\n`);
-  process.stdout.write(`  parseErrors:                 ${counters.parseErrors}\n`);
-  process.stdout.write(`  limitHits:                   ${counters.limitHits}\n`);
+  process.stdout.write(`  signaturesFetched:                ${counters.signaturesFetched}\n`);
+  process.stdout.write(`  duplicateSignaturesSkipped:       ${counters.duplicateSignaturesSkipped}\n`);
+  process.stdout.write(`  transactionsFetched:              ${counters.transactionsFetched}\n`);
+  process.stdout.write(`  nullTransactions:                 ${counters.nullTransactions}\n`);
+  process.stdout.write(`  parseErrors:                      ${counters.parseErrors}\n`);
+  process.stdout.write("\n--- diagnostic funnel ---\n");
+  process.stdout.write(`  transactionsWithInstructions:     ${counters.transactionsWithInstructions}\n`);
+  process.stdout.write(`  txMentioningPumpfunProgram:       ${counters.transactionsMentioningPumpfunProgram}\n`);
+  process.stdout.write(`  instructionsForPumpfunProgram:    ${counters.instructionsForPumpfunProgram}\n`);
+  process.stdout.write(`  createLikeInstructions:           ${counters.createLikeInstructions}\n`);
+  process.stdout.write(`  candidatesFound:                  ${counters.candidatesFound}\n`);
+  process.stdout.write(`  newLaunchesSaved:                 ${counters.newLaunchesSaved}\n`);
+  process.stdout.write("\n--- rejection reasons ---\n");
+  process.stdout.write(`  rejectedNoParsedInstruction:      ${counters.rejectedNoParsedInstruction}\n`);
+  process.stdout.write(`  rejectedUnknownInstructionShape:  ${counters.rejectedUnknownInstructionShape}\n`);
+  process.stdout.write(`  rejectedNoMint:                   ${counters.rejectedNoMint}\n`);
+  process.stdout.write(`  rejectedNoCreator:                ${counters.rejectedNoCreator}\n`);
+  process.stdout.write(`  duplicateMintsSkipped:            ${counters.duplicateMintsSkipped}\n`);
+  process.stdout.write("\n--- infra ---\n");
+  process.stdout.write(`  rpcErrors:                        ${counters.rpcErrors}\n`);
+  process.stdout.write(`  limitHits:                        ${counters.limitHits}\n`);
 
   const exitCode = counters.limitHits > 0 ? LIMIT_EXIT_CODE : 0;
   if (counters.limitHits > 0) {
