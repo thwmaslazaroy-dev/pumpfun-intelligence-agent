@@ -33,7 +33,9 @@
     "generate:budgeted:watchlist": "tsx src/scripts/generate-budgeted-watchlist.ts",
     "preview:budgeted:watchlist": "tsx src/scripts/preview-budgeted-watchlist.ts",
     "send:discord:high-confidence": "tsx src/scripts/send-discord-high-confidence-alerts.ts",
-    "radar:loop": "powershell -ExecutionPolicy Bypass -File scripts/radar-loop.ps1"
+    "radar:loop": "powershell -ExecutionPolicy Bypass -File scripts/radar-loop.ps1",
+    "probe:pumpfun:feed": "tsx src/scripts/probe-pumpfun-created-feed.ts",
+    "radar:fetch:pumpfun:created-feed": "tsx src/scripts/radar-fetch-pumpfun-created-feed.ts"
   },
   "keywords": [
     "pumpfun",
