@@ -515,19 +515,22 @@ async function main(): Promise<void> {
     const isCreate =
       parsed.kind === "CREATE" &&
       (parsed.confidence === "HIGH" || parsed.confidence === "MEDIUM");
+
+    if (hasCreateLike) {
+      logger.info("diag: createLike tx", {
+        sig: sig.signature.slice(0, 16) + "…",
+        kind: parsed.kind,
+        confidence: parsed.confidence,
+        isCreate,
+        pumpfunSeen: parsed.pumpfunProgramSeen,
+        mints: parsed.candidateMints.length,
+        wallets: parsed.candidateWallets.length,
+        createLogs: createLikeLogs.slice(0, 3),
+      });
+    }
+
     if (!isCreate) {
       if (parsed.kind === "UNKNOWN") counters.rejectedUnknownInstructionShape += 1;
-      if (hasCreateLike) {
-        logger.info("diag: createLike tx not classified as CREATE", {
-          sig: sig.signature.slice(0, 16) + "…",
-          kind: parsed.kind,
-          confidence: parsed.confidence,
-          pumpfunSeen: parsed.pumpfunProgramSeen,
-          mints: parsed.candidateMints.length,
-          wallets: parsed.candidateWallets.length,
-          createLogs: createLikeLogs.slice(0, 3),
-        });
-      }
       await sleep(TX_FETCH_DELAY_MS);
       continue;
     }
