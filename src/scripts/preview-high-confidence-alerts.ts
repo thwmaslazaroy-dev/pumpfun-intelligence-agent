@@ -260,12 +260,13 @@ function decide(
   minLaunches: number,
   scoreResult: CreatorScoreResult,
   successScore: number | undefined,
-): { decision: Decision; reason: string } {
+): { decision: Decision; reason: string; rejectedByMinLaunches: boolean } {
   // Rule 0: success score confirms spam / rug farm — hard reject before anything else
   if (successScore !== undefined && successScore < 20) {
     return {
       decision: "REJECT",
       reason: `rule 0: successScore=${successScore}<20 (confirmed spam/rug pattern)`,
+      rejectedByMinLaunches: false,
     };
   }
 
@@ -273,11 +274,12 @@ function decide(
     return {
       decision: "REJECT",
       reason: `rule 9: very negative creatorScore=${scoreResult.creatorScore}`,
+      rejectedByMinLaunches: false,
     };
   }
 
   if (creatorRow === null) {
-    return { decision: "REJECT", reason: "rule 1: no creator history" };
+    return { decision: "REJECT", reason: "rule 1: no creator history", rejectedByMinLaunches: false };
   }
 
   const creatorLabel = creatorRow.creatorOutcomeLabel;
@@ -285,6 +287,7 @@ function decide(
     return {
       decision: "REJECT",
       reason: `rule 1: creator label is ${creatorLabel}`,
+      rejectedByMinLaunches: false,
     };
   }
 
@@ -292,6 +295,7 @@ function decide(
     return {
       decision: "REJECT",
       reason: `rule 2: creatorLaunchesTracked=${creatorRow.launchesTracked} < min=${minLaunches}`,
+      rejectedByMinLaunches: true,
     };
   }
 
@@ -300,13 +304,14 @@ function decide(
     creatorRow.flat + creatorRow.noPrice + creatorRow.down + creatorRow.rugLike;
 
   if (positive === 0) {
-    return { decision: "REJECT", reason: "rule 3: creator has 0 positive outcomes" };
+    return { decision: "REJECT", reason: "rule 3: creator has 0 positive outcomes", rejectedByMinLaunches: false };
   }
 
   if (bad > positive) {
     return {
       decision: "REJECT",
       reason: `rule 4: bad=${bad} > positive=${positive}`,
+      rejectedByMinLaunches: false,
     };
   }
 
@@ -314,6 +319,7 @@ function decide(
     return {
       decision: "REJECT",
       reason: `rule 5: current tokenLabel is ${tokenLabel}`,
+      rejectedByMinLaunches: false,
     };
   }
 
@@ -331,6 +337,7 @@ function decide(
       return {
         decision: "HIGH_PRIORITY_ALERT",
         reason: `rule 6: creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"} creatorScore=${scoreResult.creatorScore} successScore=${successScore ?? "n/a"}`,
+        rejectedByMinLaunches: false,
       };
     }
     const gateBlockReason = !successScoreOk
@@ -339,12 +346,14 @@ function decide(
     return {
       decision: "WATCH_ONLY",
       reason: `rule 6b: high-priority gate not met (${gateBlockReason}); held at watch-only`,
+      rejectedByMinLaunches: false,
     };
   }
 
   return {
     decision: "WATCH_ONLY",
     reason: `rule 7: passed filters but not strong enough (creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"})`,
+    rejectedByMinLaunches: false,
   };
 }
 
@@ -650,6 +659,7 @@ function main(): void {
       .all(limit) as TokenRow[];
 
     const previews: PreviewRow[] = [];
+    let watchOnlyLimitedHistoryPromoted = 0;
     for (const t of recentTokens) {
       const m = mintMetricsByMint.get(t.mint) ?? null;
       const tokenLabel = m?.outcomeLabel ?? null;
@@ -658,7 +668,7 @@ function main(): void {
       const bad = cr ? cr.flat + cr.noPrice + cr.down + cr.rugLike : 0;
       const score = scoreCreator(cr);
       const ssEntry = successScoreByCreator.get(t.creator_wallet) ?? null;
-      let { decision, reason } = decide(tokenLabel, cr, minLaunches, score, ssEntry?.successScore);
+      let { decision, reason, rejectedByMinLaunches } = decide(tokenLabel, cr, minLaunches, score, ssEntry?.successScore);
 
       const holderRisk = holderRiskByMint.get(t.mint) ?? null;
       const holderRiskLabel = holderRisk?.label ?? null;
@@ -681,6 +691,23 @@ function main(): void {
       if (tierResult.tier === "SPAM_CREATOR" || tierResult.tier === "DEAD_CREATOR") {
         decision = "REJECT";
         reason = `creatorTier=${tierResult.tier}: ${tierResult.reason}`;
+      }
+
+      // Promote REJECT → WATCH_ONLY for ACTIVE/PROMISING creators blocked only by
+      // limited tracked outcomes (rule 2). HIGH_PRIORITY_ALERT is never produced here.
+      if (
+        rejectedByMinLaunches &&
+        decision === "REJECT" &&
+        (tierResult.tier === "ACTIVE_CREATOR" || tierResult.tier === "PROMISING_CREATOR") &&
+        (ssEntry?.successScore ?? 0) >= 45 &&
+        holderRiskLabel !== "HIGH" &&
+        holderRiskLabel !== "EXTREME" &&
+        tokenLabel !== "DOWN" &&
+        tokenLabel !== "RUG_LIKE"
+      ) {
+        decision = "WATCH_ONLY";
+        reason = `watch_only: active/promising creator (tier=${tierResult.tier} successScore=${ssEntry?.successScore}) with limited tracked outcomes (tracked=${cr?.launchesTracked ?? 0} < min=${minLaunches})`;
+        watchOnlyLimitedHistoryPromoted += 1;
       }
 
       previews.push({
@@ -736,13 +763,10 @@ function main(): void {
     process.stdout.write(`  high (60–100): ${ssDist.high}\n`);
 
     process.stdout.write("\n--- counts ---\n");
-    process.stdout.write(`  recentTokensAnalyzed:   ${recentTokens.length}\n`);
-    process.stdout.write(
-      `  mintsWithOutcomes:      ${mintMetricsByMint.size}\n`,
-    );
-    process.stdout.write(
-      `  creatorsWithOutcomes:   ${creatorRowByWallet.size}\n`,
-    );
+    process.stdout.write(`  recentTokensAnalyzed:              ${recentTokens.length}\n`);
+    process.stdout.write(`  mintsWithOutcomes:                 ${mintMetricsByMint.size}\n`);
+    process.stdout.write(`  creatorsWithOutcomes:              ${creatorRowByWallet.size}\n`);
+    process.stdout.write(`  watchOnlyLimitedHistoryPromoted:   ${watchOnlyLimitedHistoryPromoted}\n`);
 
     process.stdout.write("\n--- decision breakdown ---\n");
     const orderedDecisions: Decision[] = [
