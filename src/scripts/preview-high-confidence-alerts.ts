@@ -10,11 +10,19 @@ import {
   CreatorTierResult,
 } from "../lib/budgeted-watchlist-core";
 
+// ── Row shapes from SQLite ─────────────────────────────────────────────────────
+
 interface TokenRow {
   mint: string;
   creator_wallet: string;
   launched_at: number;
   symbol: string;
+  // Feed-level counters stored at ingest time (from Pump.fun created feed)
+  buy_count: number;
+  sell_count: number;
+  volume_usd: number;
+  initial_market_cap_usd: number;
+  bonding_curve_progress: number;
 }
 
 interface JoinRow {
@@ -61,6 +69,8 @@ const BAD_CURRENT_TOKEN_LABELS = new Set([
 ]);
 const OK_CURRENT_TOKEN_LABELS = new Set(["ACTIVE_FLAT", "UP", "STRONG_GAIN"]);
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function resolveDbPath(databaseUrl: string): string {
   const stripped = databaseUrl.startsWith("sqlite:")
     ? databaseUrl.slice("sqlite:".length)
@@ -83,6 +93,14 @@ function shorten(s: string): string {
 function pad(s: string, width: number): string {
   return s.length >= width ? s : s + " ".repeat(width - s.length);
 }
+
+function fmtUsd(n: number): string {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${n.toFixed(2)}`;
+}
+
+// ── Outcome classification ─────────────────────────────────────────────────────
 
 function classifyOutcome(m: {
   pricedObservationCount: number;
@@ -171,6 +189,8 @@ function computeMintMetrics(
   };
 }
 
+// ── Creator scoring ───────────────────────────────────────────────────────────
+
 function classifyCreator(c: CreatorRow): string {
   const promising =
     c.strongGain + c.up + c.activeFlat >= 2 &&
@@ -224,10 +244,7 @@ function scoreCreator(c: CreatorRow | null): CreatorScoreResult {
   const negativeOutcomes = c.flat + c.noPrice + c.down + c.rugLike;
   const previousLaunches = c.launchesTracked || 0;
 
-  if (
-    previousLaunches >= 5 &&
-    negativeOutcomes / previousLaunches >= 0.7
-  ) {
+  if (previousLaunches >= 5 && negativeOutcomes / previousLaunches >= 0.7) {
     score -= 5;
     reasons.push("spam penalty: many launches with mostly bad outcomes (-5)");
   }
@@ -244,23 +261,28 @@ function scoreCreator(c: CreatorRow | null): CreatorScoreResult {
     reasons.push("no scored events yet");
   }
 
-  return {
-    creatorScore: score,
-    creatorScoreReason: reasons,
-    previousLaunches,
-    positiveOutcomes,
-    negativeOutcomes,
-  };
+  return { creatorScore: score, creatorScoreReason: reasons, previousLaunches, positiveOutcomes, negativeOutcomes };
 }
+
+// ── Decision logic ────────────────────────────────────────────────────────────
 
 type Decision = "HIGH_PRIORITY_ALERT" | "WATCH_ONLY" | "REJECT";
 
+/**
+ * Core per-token decision function. Returns the initial decision before
+ * post-decision overrides (holder risk, tier hard-reject, WATCH_ONLY gate).
+ *
+ * tokenHasRealFeedActivity: true when the token's feed-level counters
+ * (buy_count, sell_count, volume_usd) show genuine on-chain activity —
+ * required for HIGH_PRIORITY_ALERT so we don't fire on Moralis swap_count alone.
+ */
 function decide(
   tokenLabel: string | null,
   creatorRow: CreatorRow | null,
   minLaunches: number,
   scoreResult: CreatorScoreResult,
   successScore: number | undefined,
+  tokenHasRealFeedActivity: boolean,
 ): { decision: Decision; reason: string; rejectedByMinLaunches: boolean } {
   // Rule 0: success score confirms spam / rug farm — hard reject before anything else
   if (successScore !== undefined && successScore < 20) {
@@ -301,8 +323,7 @@ function decide(
   }
 
   const positive = creatorRow.strongGain + creatorRow.up + creatorRow.activeFlat;
-  const bad =
-    creatorRow.flat + creatorRow.noPrice + creatorRow.down + creatorRow.rugLike;
+  const bad = creatorRow.flat + creatorRow.noPrice + creatorRow.down + creatorRow.rugLike;
 
   if (positive === 0) {
     return { decision: "REJECT", reason: "rule 3: creator has 0 positive outcomes", rejectedByMinLaunches: false };
@@ -324,29 +345,32 @@ function decide(
     };
   }
 
-  const eligibleByCreator =
-    creatorLabel === "PROMISING" || (positive >= 2 && bad <= positive);
+  const eligibleByCreator = creatorLabel === "PROMISING" || (positive >= 2 && bad <= positive);
   const tokenOk = tokenLabel === null || OK_CURRENT_TOKEN_LABELS.has(tokenLabel);
-  const tokenStrictOk =
-    tokenLabel !== null && OK_CURRENT_TOKEN_LABELS.has(tokenLabel);
+  const tokenStrictOk = tokenLabel !== null && OK_CURRENT_TOKEN_LABELS.has(tokenLabel);
 
   if (eligibleByCreator && tokenOk) {
-    // HIGH_PRIORITY_ALERT requires strong creatorScore, confirmed token momentum,
-    // and a successScore >= 45 so borderline spam farms cannot slip through.
+    // HIGH_PRIORITY_ALERT requires:
+    //   • strong creatorScore
+    //   • confirmed token momentum (strict label)
+    //   • successScore >= 45 (blocks borderline spam farms)
+    //   • real feed-level activity on the current token (not just Moralis swap_count)
     const successScoreOk = successScore === undefined || successScore >= 45;
-    if (scoreResult.creatorScore >= 8 && tokenStrictOk && successScoreOk) {
+    if (scoreResult.creatorScore >= 8 && tokenStrictOk && successScoreOk && tokenHasRealFeedActivity) {
       return {
         decision: "HIGH_PRIORITY_ALERT",
         reason: `rule 6: creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"} creatorScore=${scoreResult.creatorScore} successScore=${successScore ?? "n/a"}`,
         rejectedByMinLaunches: false,
       };
     }
-    const gateBlockReason = !successScoreOk
-      ? `successScore=${successScore}<45`
-      : `creatorScore=${scoreResult.creatorScore}<8 or tokenLabel=${tokenLabel ?? "n/a"} not strict-ok`;
+    const gateBlocks: string[] = [];
+    if (scoreResult.creatorScore < 8) gateBlocks.push(`creatorScore=${scoreResult.creatorScore}<8`);
+    if (!tokenStrictOk) gateBlocks.push(`tokenLabel=${tokenLabel ?? "n/a"} not in OK set`);
+    if (!successScoreOk) gateBlocks.push(`successScore=${successScore}<45`);
+    if (!tokenHasRealFeedActivity) gateBlocks.push("no real feed activity (buy/sell/vol=0)");
     return {
       decision: "WATCH_ONLY",
-      reason: `rule 6b: high-priority gate not met (${gateBlockReason}); held at watch-only`,
+      reason: `rule 6b: high-priority gate not met (${gateBlocks.join("; ")}); held at watch-only`,
       rejectedByMinLaunches: false,
     };
   }
@@ -357,6 +381,8 @@ function decide(
     rejectedByMinLaunches: false,
   };
 }
+
+// ── Preview record ────────────────────────────────────────────────────────────
 
 interface HolderRiskEval {
   label: string;
@@ -382,6 +408,9 @@ interface PreviewRow {
   creatorTierReason: string;
   successScore: number | null;
   successScoreReason: string | null;
+  // Current token feed signals
+  hasRealFeedActivity: boolean;
+  isOnBudgetedWatchlist: boolean;
 }
 
 function decisionRank(d: Decision): number {
@@ -393,29 +422,24 @@ function decisionRank(d: Decision): number {
 function comparePreviews(a: PreviewRow, b: PreviewRow): number {
   const dr = decisionRank(a.decision) - decisionRank(b.decision);
   if (dr !== 0) return dr;
-
   if (b.positive !== a.positive) return b.positive - a.positive;
-
   const aGain = a.creatorRow?.avgGainPercent;
   const bGain = b.creatorRow?.avgGainPercent;
   if (aGain == null && bGain != null) return 1;
   if (aGain != null && bGain == null) return -1;
   if (aGain != null && bGain != null && aGain !== bGain) return bGain - aGain;
-
   const aTracked = a.creatorRow?.launchesTracked ?? 0;
   const bTracked = b.creatorRow?.launchesTracked ?? 0;
   if (aTracked !== bTracked) return bTracked - aTracked;
-
   return b.token.launched_at - a.token.launched_at;
 }
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 function main(): void {
   const databaseUrl = process.env.DATABASE_URL ?? "./data/pumpfun-agent.sqlite";
   const limit = parseLimit(process.env.HIGH_CONFIDENCE_ALERT_LIMIT, 100);
-  const minLaunches = parseLimit(
-    process.env.HIGH_CONFIDENCE_MIN_CREATOR_LAUNCHES,
-    3,
-  );
+  const minLaunches = parseLimit(process.env.HIGH_CONFIDENCE_MIN_CREATOR_LAUNCHES, 3);
   const maxAlerts = parseLimit(process.env.HIGH_CONFIDENCE_MAX_ALERTS, 2);
   const filePath = resolveDbPath(databaseUrl);
 
@@ -427,11 +451,23 @@ function main(): void {
   process.stdout.write(`  highConfidenceMaxAlerts:        ${maxAlerts}\n`);
 
   if (!fs.existsSync(filePath)) {
-    process.stdout.write(
-      `\nSQLite file not found at ${filePath}. Run ingestion first.\n`,
-    );
+    process.stdout.write(`\nSQLite file not found at ${filePath}. Run ingestion first.\n`);
     process.exit(1);
   }
+
+  // Load budgeted-watchlist mints (optional — used as WATCH_ONLY activity signal)
+  const budgetedMints = new Set<string>();
+  const watchlistPath = process.env.OUTCOME_WATCHLIST_PATH ?? "./data/budgeted-outcome-watchlist.txt";
+  try {
+    const wlContent = fs.readFileSync(
+      path.isAbsolute(watchlistPath) ? watchlistPath : path.resolve(process.cwd(), watchlistPath),
+      "utf8",
+    );
+    for (const line of wlContent.split("\n")) {
+      const t = line.trim();
+      if (t && !t.startsWith("#")) budgetedMints.add(t);
+    }
+  } catch { /* file not yet generated — budgetedMints stays empty */ }
 
   let db: Database.Database;
   try {
@@ -443,25 +479,19 @@ function main(): void {
     process.exit(1);
   }
 
-  // Load holder risk evaluations (table may not exist on first run — handle gracefully)
+  // Load holder risk evaluations (table may not exist on first run)
   const holderRiskByMint = new Map<string, HolderRiskEval>();
   try {
     const hrRows = db
-      .prepare(
-        "SELECT mint, holder_risk_label, holder_risk_reason FROM holder_risk_evaluations",
-      )
+      .prepare("SELECT mint, holder_risk_label, holder_risk_reason FROM holder_risk_evaluations")
       .all() as { mint: string; holder_risk_label: string; holder_risk_reason: string }[];
     for (const r of hrRows) {
-      holderRiskByMint.set(r.mint, {
-        label: r.holder_risk_label,
-        reason: r.holder_risk_reason,
-      });
+      holderRiskByMint.set(r.mint, { label: r.holder_risk_label, reason: r.holder_risk_reason });
     }
-  } catch {
-    // Table does not exist yet — evaluate:holder-risk has not been run; show n/a for all
-  }
+  } catch { /* table not yet created */ }
 
   try {
+    // ── Outcomes → per-mint metrics ────────────────────────────────────────────
     const joinRows = db
       .prepare(
         `SELECT t.mint, t.creator_wallet, o.observed_at, o.usd_price, o.swap_count
@@ -475,14 +505,9 @@ function main(): void {
     const mintCreator = new Map<string, string>();
     for (const r of joinRows) {
       let bucket = byMint.get(r.mint);
-      if (!bucket) {
-        bucket = [];
-        byMint.set(r.mint, bucket);
-      }
+      if (!bucket) { bucket = []; byMint.set(r.mint, bucket); }
       bucket.push(r);
-      if (!mintCreator.has(r.mint)) {
-        mintCreator.set(r.mint, r.creator_wallet);
-      }
+      if (!mintCreator.has(r.mint)) mintCreator.set(r.mint, r.creator_wallet);
     }
 
     const mintMetricsByMint = new Map<string, MintMetrics>();
@@ -491,6 +516,7 @@ function main(): void {
       mintMetricsByMint.set(mint, computeMintMetrics(mint, creator, rows));
     }
 
+    // ── Per-creator outcome aggregation ───────────────────────────────────────
     interface CreatorAgg {
       creatorWallet: string;
       launchesTracked: number;
@@ -507,30 +533,13 @@ function main(): void {
     for (const m of mintMetricsByMint.values()) {
       let agg = byCreator.get(m.creatorWallet);
       if (!agg) {
-        agg = {
-          creatorWallet: m.creatorWallet,
-          launchesTracked: 0,
-          gainSum: 0,
-          gainCount: 0,
-          swapDeltaSum: 0,
-          swapDeltaCount: 0,
-          labelCounts: {},
-          totalSwaps: 0,
-          pricedRows: 0,
-        };
+        agg = { creatorWallet: m.creatorWallet, launchesTracked: 0, gainSum: 0, gainCount: 0, swapDeltaSum: 0, swapDeltaCount: 0, labelCounts: {}, totalSwaps: 0, pricedRows: 0 };
         byCreator.set(m.creatorWallet, agg);
       }
       agg.launchesTracked += 1;
-      if (typeof m.gainFromStartPercent === "number") {
-        agg.gainSum += m.gainFromStartPercent;
-        agg.gainCount += 1;
-      }
-      if (typeof m.swapCountDelta === "number") {
-        agg.swapDeltaSum += m.swapCountDelta;
-        agg.swapDeltaCount += 1;
-      }
-      agg.labelCounts[m.outcomeLabel] =
-        (agg.labelCounts[m.outcomeLabel] ?? 0) + 1;
+      if (typeof m.gainFromStartPercent === "number") { agg.gainSum += m.gainFromStartPercent; agg.gainCount += 1; }
+      if (typeof m.swapCountDelta === "number") { agg.swapDeltaSum += m.swapCountDelta; agg.swapDeltaCount += 1; }
+      agg.labelCounts[m.outcomeLabel] = (agg.labelCounts[m.outcomeLabel] ?? 0) + 1;
       agg.totalSwaps += m.latestSwapCount ?? 0;
       agg.pricedRows += m.pricedObservationCount;
     }
@@ -538,8 +547,7 @@ function main(): void {
     const creatorRowByWallet = new Map<string, CreatorRow>();
     for (const agg of byCreator.values()) {
       const avgGainPercent = agg.gainCount > 0 ? agg.gainSum / agg.gainCount : null;
-      const avgSwapDelta =
-        agg.swapDeltaCount > 0 ? agg.swapDeltaSum / agg.swapDeltaCount : null;
+      const avgSwapDelta = agg.swapDeltaCount > 0 ? agg.swapDeltaSum / agg.swapDeltaCount : null;
       const lc = agg.labelCounts;
       const row: CreatorRow = {
         creatorWallet: agg.creatorWallet,
@@ -559,7 +567,7 @@ function main(): void {
       creatorRowByWallet.set(row.creatorWallet, row);
     }
 
-    // Total launch count + first/last timestamp per creator (includes tokens without outcome rows)
+    // ── Per-creator structural data ────────────────────────────────────────────
     const launchCountByCreator = new Map<string, number>();
     const firstLaunchAtByCreator = new Map<string, number>();
     const lastLaunchAtByCreator = new Map<string, number>();
@@ -576,11 +584,8 @@ function main(): void {
         firstLaunchAtByCreator.set(r.creator_wallet, r.first_at);
         lastLaunchAtByCreator.set(r.creator_wallet, r.last_at);
       }
-    } catch {
-      // tokens table always exists — this catch is a safeguard only
-    }
+    } catch { /* safeguard */ }
 
-    // Extreme holder count per creator
     const extremeCountByCreator = new Map<string, number>();
     try {
       const exRows = db
@@ -593,11 +598,8 @@ function main(): void {
         )
         .all() as { creator_wallet: string; cnt: number }[];
       for (const r of exRows) extremeCountByCreator.set(r.creator_wallet, r.cnt);
-    } catch {
-      // holder_risk_evaluations may not exist yet — no EXTREME data
-    }
+    } catch { /* holder_risk_evaluations may not exist */ }
 
-    // HIGH holder count per creator
     const highCountByCreator = new Map<string, number>();
     try {
       const highRows = db
@@ -610,33 +612,27 @@ function main(): void {
         )
         .all() as { creator_wallet: string; cnt: number }[];
       for (const r of highRows) highCountByCreator.set(r.creator_wallet, r.cnt);
-    } catch {
-      // holder_risk_evaluations may not exist yet
-    }
+    } catch { /* holder_risk_evaluations may not exist */ }
 
-    // Launch timestamps per creator (sorted ascending) — used for burst detection
+    // ── Burst & zero-activity data ─────────────────────────────────────────────
     const timestampsByCreator = new Map<string, number[]>();
     try {
       const tsRows = db
-        .prepare(
-          "SELECT creator_wallet, launched_at FROM tokens ORDER BY creator_wallet ASC, launched_at ASC",
-        )
+        .prepare("SELECT creator_wallet, launched_at FROM tokens ORDER BY creator_wallet ASC, launched_at ASC")
         .all() as { creator_wallet: string; launched_at: number }[];
       for (const r of tsRows) {
         let arr = timestampsByCreator.get(r.creator_wallet);
         if (!arr) { arr = []; timestampsByCreator.set(r.creator_wallet, arr); }
         arr.push(r.launched_at);
       }
-    } catch { /* tokens table always exists */ }
+    } catch { /* safeguard */ }
 
-    // Min burst window per creator (seconds for any 3 consecutive launches)
     const minBurstWindowSecByCreator = new Map<string, number>();
     for (const [wallet, ts] of timestampsByCreator.entries()) {
       const w = computeMinBurstWindowSec(ts);
       if (w !== null) minBurstWindowSecByCreator.set(wallet, w);
     }
 
-    // Per-creator zero-activity and total volume stats (from tokens table)
     interface ZeroActivityStats { count: number; totalVolumeUsd: number }
     const zeroActivityByCreator = new Map<string, ZeroActivityStats>();
     try {
@@ -658,7 +654,7 @@ function main(): void {
       }
     } catch { /* safeguard */ }
 
-    // Creator success score — computed before tier so tier can use it
+    // ── Success score (computed before tier so tier can use it) ────────────────
     const successScoreByCreator = new Map<string, CreatorSuccessScoreResult>();
     for (const agg of byCreator.values()) {
       const lc = agg.labelCounts;
@@ -683,7 +679,7 @@ function main(): void {
       successScoreByCreator.set(agg.creatorWallet, computeCreatorSuccessScore(ssInput));
     }
 
-    // Build creator tier map (successScore + burst/activity signals passed)
+    // ── Creator tier (uses successScore + burst/activity signals) ─────────────
     const creatorTierByWallet = new Map<string, CreatorTierResult>();
     for (const agg of byCreator.values()) {
       const totalLaunches = launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked;
@@ -703,17 +699,31 @@ function main(): void {
       );
     }
 
+    // ── Recent tokens (includes feed-level counters for real-activity check) ───
     const recentTokens = db
       .prepare(
-        `SELECT mint, creator_wallet, launched_at, symbol
+        `SELECT mint, creator_wallet, launched_at, symbol,
+                buy_count, sell_count, volume_usd,
+                initial_market_cap_usd, bonding_curve_progress
          FROM tokens
          ORDER BY launched_at DESC
          LIMIT ?`,
       )
       .all(limit) as TokenRow[];
 
+    // ── Per-token decision loop ────────────────────────────────────────────────
+    // Counters — all rejection reasons are tracked separately for diagnostics
+    let rejectedSpamCreator = 0;       // tier = SPAM_CREATOR (any sub-reason)
+    let rejectedDeadCreator = 0;       // tier = DEAD_CREATOR
+    let rejectedBurstCreator = 0;      // SPAM_CREATOR specifically via launchBurst
+    let rejectedZeroActivityCreator = 0; // SPAM_CREATOR specifically via zeroFeedActivity
+    let rejectedHighHolderRisk = 0;    // HIGH or EXTREME holder concentration
+    let rejectedNoCurrentTokenActivity = 0; // WATCH_ONLY gate: no feed activity & not budgeted
+    let watchOnlyLimitedHistoryPromoted = 0; // REJECT→WATCH_ONLY for ACTIVE/PROMISING
+    let highPriorityPassed = 0;        // final HIGH_PRIORITY_ALERT count (after cap)
+
     const previews: PreviewRow[] = [];
-    let watchOnlyLimitedHistoryPromoted = 0;
+
     for (const t of recentTokens) {
       const m = mintMetricsByMint.get(t.mint) ?? null;
       const tokenLabel = m?.outcomeLabel ?? null;
@@ -722,22 +732,32 @@ function main(): void {
       const bad = cr ? cr.flat + cr.noPrice + cr.down + cr.rugLike : 0;
       const score = scoreCreator(cr);
       const ssEntry = successScoreByCreator.get(t.creator_wallet) ?? null;
-      let { decision, reason, rejectedByMinLaunches } = decide(tokenLabel, cr, minLaunches, score, ssEntry?.successScore);
+
+      // Real feed activity: buy/sell/volume recorded at ingest time from Pump.fun feed.
+      // Distinct from Moralis swap_count in token_outcomes which may lag or differ.
+      const hasRealFeedActivity =
+        t.buy_count > 0 || t.sell_count > 0 || t.volume_usd > 0.001;
+      const isOnBudgetedWatchlist = budgetedMints.has(t.mint);
+
+      let { decision, reason, rejectedByMinLaunches } = decide(
+        tokenLabel, cr, minLaunches, score, ssEntry?.successScore, hasRealFeedActivity,
+      );
 
       const holderRisk = holderRiskByMint.get(t.mint) ?? null;
       const holderRiskLabel = holderRisk?.label ?? null;
       const holderRiskReason = holderRisk?.reason ?? null;
 
-      // Block HIGH_PRIORITY_ALERT when holder concentration is HIGH or EXTREME
-      if (
-        decision === "HIGH_PRIORITY_ALERT" &&
-        (holderRiskLabel === "HIGH" || holderRiskLabel === "EXTREME")
-      ) {
-        decision = "WATCH_ONLY";
-        reason = `holder risk ${holderRiskLabel} blocks alert: ${holderRiskReason ?? "see evaluate:holder-risk"}`;
+      // Holder risk: HIGH or EXTREME blocks both HIGH_PRIORITY_ALERT and WATCH_ONLY.
+      // We want WATCH_ONLY reserved for clean-holder creators only.
+      if (holderRiskLabel === "HIGH" || holderRiskLabel === "EXTREME") {
+        if (decision === "HIGH_PRIORITY_ALERT" || decision === "WATCH_ONLY") {
+          decision = "REJECT";
+          reason = `holderRisk=${holderRiskLabel} blocks decision: ${holderRiskReason ?? "see evaluate:holder-risk"}`;
+          rejectedHighHolderRisk++;
+        }
       }
 
-      // Creator tier — hard-reject SPAM and DEAD regardless of earlier decision
+      // Creator tier: SPAM and DEAD are always hard-rejected.
       const tierResult = creatorTierByWallet.get(t.creator_wallet) ?? {
         tier: "UNKNOWN_CREATOR" as const,
         reason: "no outcome data for this creator",
@@ -745,6 +765,13 @@ function main(): void {
       if (tierResult.tier === "SPAM_CREATOR" || tierResult.tier === "DEAD_CREATOR") {
         decision = "REJECT";
         reason = `creatorTier=${tierResult.tier}: ${tierResult.reason}`;
+        if (tierResult.tier === "SPAM_CREATOR") {
+          rejectedSpamCreator++;
+          if (tierResult.reason.includes("launchBurst")) rejectedBurstCreator++;
+          if (tierResult.reason.includes("zeroFeedActivity")) rejectedZeroActivityCreator++;
+        } else {
+          rejectedDeadCreator++;
+        }
       }
 
       // Promote REJECT → WATCH_ONLY for ACTIVE/PROMISING creators blocked only by
@@ -761,7 +788,31 @@ function main(): void {
       ) {
         decision = "WATCH_ONLY";
         reason = `watch_only: active/promising creator (tier=${tierResult.tier} successScore=${ssEntry?.successScore}) with limited tracked outcomes (tracked=${cr?.launchesTracked ?? 0} < min=${minLaunches})`;
-        watchOnlyLimitedHistoryPromoted += 1;
+        watchOnlyLimitedHistoryPromoted++;
+      }
+
+      // WATCH_ONLY quality gate: require ACTIVE/PROMISING tier + successScore >= 45
+      // + at least some activity signal (real feed or on budgeted watchlist).
+      // This keeps WATCH_ONLY rare and meaningful rather than a catch-all.
+      if (decision === "WATCH_ONLY") {
+        const tierOk =
+          tierResult.tier === "ACTIVE_CREATOR" || tierResult.tier === "PROMISING_CREATOR";
+        const ssOk = (ssEntry?.successScore ?? 0) >= 45;
+        const activityOk = hasRealFeedActivity || isOnBudgetedWatchlist;
+
+        if (!tierOk || !ssOk || !activityOk) {
+          let gateReason: string;
+          if (!tierOk) {
+            gateReason = `tier=${tierResult.tier} (ACTIVE/PROMISING required for WATCH_ONLY)`;
+          } else if (!ssOk) {
+            gateReason = `successScore=${ssEntry?.successScore ?? 0}<45`;
+          } else {
+            gateReason = `no real feed activity (buy=${t.buy_count} sell=${t.sell_count} vol=${t.volume_usd.toFixed(4)}) and not on budgeted watchlist`;
+            rejectedNoCurrentTokenActivity++;
+          }
+          decision = "REJECT";
+          reason = `watch_only gate: ${gateReason}`;
+        }
       }
 
       previews.push({
@@ -783,20 +834,24 @@ function main(): void {
         creatorTierReason: tierResult.reason,
         successScore: ssEntry?.successScore ?? null,
         successScoreReason: ssEntry?.successScoreReason ?? null,
+        hasRealFeedActivity,
+        isOnBudgetedWatchlist,
       });
     }
 
     previews.sort(comparePreviews);
 
+    // Apply alert cap — demote excess HIGH_PRIORITY_ALERT to WATCH_ONLY
     let alertCount = 0;
     for (const p of previews) {
       if (p.decision !== "HIGH_PRIORITY_ALERT") continue;
       if (alertCount < maxAlerts) {
-        alertCount += 1;
+        alertCount++;
+        highPriorityPassed++;
         continue;
       }
       p.decision = "WATCH_ONLY";
-      p.reason = `rule 8: cap reached (max=${maxAlerts})`;
+      p.reason = `rule 8: alert cap reached (max=${maxAlerts})`;
     }
 
     const decisionCounts = new Map<Decision, number>();
@@ -804,7 +859,7 @@ function main(): void {
       decisionCounts.set(p.decision, (decisionCounts.get(p.decision) ?? 0) + 1);
     }
 
-    // Success score distribution
+    // ── Success score distribution ─────────────────────────────────────────────
     const ssDist = { low: 0, mid: 0, high: 0 };
     for (const r of successScoreByCreator.values()) {
       if (r.successScore < 30) ssDist.low++;
@@ -816,18 +871,25 @@ function main(): void {
     process.stdout.write(`  mid  (30–59):  ${ssDist.mid}\n`);
     process.stdout.write(`  high (60–100): ${ssDist.high}\n`);
 
+    // ── Counters ──────────────────────────────────────────────────────────────
     process.stdout.write("\n--- counts ---\n");
     process.stdout.write(`  recentTokensAnalyzed:              ${recentTokens.length}\n`);
     process.stdout.write(`  mintsWithOutcomes:                 ${mintMetricsByMint.size}\n`);
     process.stdout.write(`  creatorsWithOutcomes:              ${creatorRowByWallet.size}\n`);
+    process.stdout.write(`  budgetedWatchlistMints:            ${budgetedMints.size}\n`);
+    process.stdout.write("\n--- rejection counters ---\n");
+    process.stdout.write(`  rejectedSpamCreator:               ${rejectedSpamCreator}\n`);
+    process.stdout.write(`  rejectedDeadCreator:               ${rejectedDeadCreator}\n`);
+    process.stdout.write(`  rejectedBurstCreator:              ${rejectedBurstCreator}\n`);
+    process.stdout.write(`  rejectedZeroActivityCreator:       ${rejectedZeroActivityCreator}\n`);
+    process.stdout.write(`  rejectedHighHolderRisk:            ${rejectedHighHolderRisk}\n`);
+    process.stdout.write(`  rejectedNoCurrentTokenActivity:    ${rejectedNoCurrentTokenActivity}\n`);
     process.stdout.write(`  watchOnlyLimitedHistoryPromoted:   ${watchOnlyLimitedHistoryPromoted}\n`);
+    process.stdout.write(`  highPriorityPassed:                ${highPriorityPassed}\n`);
 
+    // ── Decision breakdown ────────────────────────────────────────────────────
     process.stdout.write("\n--- decision breakdown ---\n");
-    const orderedDecisions: Decision[] = [
-      "HIGH_PRIORITY_ALERT",
-      "WATCH_ONLY",
-      "REJECT",
-    ];
+    const orderedDecisions: Decision[] = ["HIGH_PRIORITY_ALERT", "WATCH_ONLY", "REJECT"];
     if (previews.length === 0) {
       process.stdout.write("  (no recent tokens)\n");
     } else {
@@ -836,13 +898,13 @@ function main(): void {
       }
     }
 
-    const highPriorityCount = decisionCounts.get("HIGH_PRIORITY_ALERT") ?? 0;
-    if (highPriorityCount === 0) {
+    if ((decisionCounts.get("HIGH_PRIORITY_ALERT") ?? 0) === 0) {
       process.stdout.write(
         "\nNo high-confidence alerts. This is expected when data quality/history is still low.\n",
       );
     }
 
+    // ── Full candidate detail (strongest first) ────────────────────────────────
     process.stdout.write("\n--- candidates (strongest first) ---\n");
     if (previews.length === 0) {
       process.stdout.write("  (no tokens in tokens table)\n");
@@ -858,43 +920,52 @@ function main(): void {
           ? "n/a"
           : `${p.creatorRow.avgGainPercent.toFixed(2)}%`;
       const cr = p.creatorRow;
-      const strg = cr?.strongGain ?? 0;
-      const up = cr?.up ?? 0;
-      const actv = cr?.activeFlat ?? 0;
-      const flat = cr?.flat ?? 0;
-      const nopx = cr?.noPrice ?? 0;
-      const down = cr?.down ?? 0;
-      const rug = cr?.rugLike ?? 0;
       process.stdout.write(
         `  [${idx}] ${launchedAtIso}  symbol=${p.token.symbol}  mint=${shorten(p.token.mint)}  creator=${shorten(p.token.creator_wallet)}\n`,
+      );
+      process.stdout.write(
+        `      feed: buy=${p.token.buy_count}  sell=${p.token.sell_count}  vol=${fmtUsd(p.token.volume_usd)}  mcap=${fmtUsd(p.token.initial_market_cap_usd)}  bc=${(p.token.bonding_curve_progress * 100).toFixed(1)}%  realActivity=${p.hasRealFeedActivity}  budgeted=${p.isOnBudgetedWatchlist}\n`,
       );
       process.stdout.write(
         `      tracked=${tracked}  creatorLabel=${creatorLabel}  tokenLabel=${tokenLabelStr}\n`,
       );
       process.stdout.write(
-        `      avgCreatorGain=${avgGain}  positive(STRG/UP/ACTV)=${strg}/${up}/${actv}  bad(FLAT/NOPX/DOWN/RUG)=${flat}/${nopx}/${down}/${rug}\n`,
+        `      avgCreatorGain=${avgGain}  positive(STRG/UP/ACTV)=${cr?.strongGain ?? 0}/${cr?.up ?? 0}/${cr?.activeFlat ?? 0}  bad(FLAT/NOPX/DOWN/RUG)=${cr?.flat ?? 0}/${cr?.noPrice ?? 0}/${cr?.down ?? 0}/${cr?.rugLike ?? 0}\n`,
       );
       process.stdout.write(
         `      creatorScore=${p.creatorScore}  previousLaunches=${p.previousLaunches}  positiveOutcomes=${p.positiveOutcomes}  negativeOutcomes=${p.negativeOutcomes}\n`,
       );
-      process.stdout.write(
-        `      creatorScoreReason=${p.creatorScoreReason.join("; ")}\n`,
-      );
-      process.stdout.write(
-        `      holderRisk=${p.holderRiskLabel ?? "n/a"}  holderRiskReason=${p.holderRiskReason ?? "n/a"}\n`,
-      );
-      process.stdout.write(
-        `      creatorTier=${p.creatorTier}  creatorTierReason=${p.creatorTierReason}\n`,
-      );
-      process.stdout.write(
-        `      successScore=${p.successScore ?? "n/a"}  successScoreReason=${p.successScoreReason ?? "n/a"}\n`,
-      );
-      process.stdout.write(
-        `      finalDecision=${p.decision}  reason=${p.reason}\n`,
-      );
+      process.stdout.write(`      creatorScoreReason=${p.creatorScoreReason.join("; ")}\n`);
+      process.stdout.write(`      holderRisk=${p.holderRiskLabel ?? "n/a"}  holderRiskReason=${p.holderRiskReason ?? "n/a"}\n`);
+      process.stdout.write(`      creatorTier=${p.creatorTier}  creatorTierReason=${p.creatorTierReason}\n`);
+      process.stdout.write(`      successScore=${p.successScore ?? "n/a"}  successScoreReason=${p.successScoreReason ?? "n/a"}\n`);
+      process.stdout.write(`      finalDecision=${p.decision}  reason=${p.reason}\n`);
       idx++;
     }
 
+    // ── Dry-run report: compact table for quick scanning ──────────────────────
+    process.stdout.write("\n--- dry-run report (recent tokens, compact) ---\n");
+    process.stdout.write(
+      `  ${"SYMBOL".padEnd(12)} ${"MINT".padEnd(18)} ${"CREATOR".padEnd(18)} ${"BUY".padStart(4)} ${"SELL".padStart(4)} ${"VOL".padStart(10)} ${"TIER".padEnd(20)} ${"SS".padStart(3)} ${"HOLDER".padEnd(8)} ${"DECISION".padEnd(20)} REASON\n`,
+    );
+    process.stdout.write(`  ${"-".repeat(150)}\n`);
+    for (const p of previews) {
+      const sym = pad(p.token.symbol, 12);
+      const mint = pad(shorten(p.token.mint), 18);
+      const creator = pad(shorten(p.token.creator_wallet), 18);
+      const buy = String(p.token.buy_count).padStart(4);
+      const sell = String(p.token.sell_count).padStart(4);
+      const vol = fmtUsd(p.token.volume_usd).padStart(10);
+      const tier = pad(p.creatorTier, 20);
+      const ss = (p.successScore !== null ? String(p.successScore) : "n/a").padStart(3);
+      const hr = pad(p.holderRiskLabel ?? "n/a", 8);
+      const dec = pad(p.decision, 20);
+      // Truncate reason for compact display
+      const reasonShort = p.reason.length > 60 ? p.reason.slice(0, 57) + "..." : p.reason;
+      process.stdout.write(`  ${sym} ${mint} ${creator} ${buy} ${sell} ${vol} ${tier} ${ss} ${hr} ${dec} ${reasonShort}\n`);
+    }
+
+    // ── JSON output ───────────────────────────────────────────────────────────
     const jsonOut = previews.map((p) => ({
       mint: p.token.mint,
       creatorWallet: p.token.creator_wallet,
@@ -920,11 +991,16 @@ function main(): void {
       creatorTierReason: p.creatorTierReason,
       successScore: p.successScore,
       successScoreReason: p.successScoreReason,
+      // Feed signals
+      tokenBuyCount: p.token.buy_count,
+      tokenSellCount: p.token.sell_count,
+      tokenVolumeUsd: p.token.volume_usd,
+      tokenInitialMcapUsd: p.token.initial_market_cap_usd,
+      tokenBondingCurveProgress: p.token.bonding_curve_progress,
+      hasRealFeedActivity: p.hasRealFeedActivity,
+      isOnBudgetedWatchlist: p.isOnBudgetedWatchlist,
     }));
-    const outPath = path.resolve(
-      process.cwd(),
-      "./data/high-confidence-alerts.json",
-    );
+    const outPath = path.resolve(process.cwd(), "./data/high-confidence-alerts.json");
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, JSON.stringify(jsonOut, null, 2));
     process.stdout.write(`\n  wrote: ${outPath}\n`);
