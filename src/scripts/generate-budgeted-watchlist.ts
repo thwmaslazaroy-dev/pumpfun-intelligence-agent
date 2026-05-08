@@ -17,6 +17,7 @@ import {
   computeMintMetrics,
   evaluateBudgetedReject,
   scoreCandidate,
+  tokenHasActivity,
 } from "../lib/budgeted-watchlist-core";
 
 interface TokenRow {
@@ -259,25 +260,37 @@ function main(): void {
       if (w !== null) minBurstWindowSecByCreator.set(wallet, w);
     }
 
-    // Per-creator zero-activity and total volume stats (from tokens table)
+    // Per-creator zero-activity stats — computed in TypeScript using tokenHasActivity()
+    // so the definition is identical to the per-token realActivity check.
     interface ZeroActivityStats { count: number; totalVolumeUsd: number }
     const zeroActivityByCreator = new Map<string, ZeroActivityStats>();
     try {
-      const zaRows = db
+      const allTokenActivity = db
         .prepare(
-          `SELECT creator_wallet,
-             SUM(CASE WHEN buy_count = 0 AND sell_count = 0 AND volume_usd <= 0.001
-                      THEN 1 ELSE 0 END) as zero_count,
-             SUM(volume_usd) as total_volume
-           FROM tokens
-           GROUP BY creator_wallet`,
+          "SELECT creator_wallet, buy_count, sell_count, volume_usd, bonding_curve_progress FROM tokens",
         )
-        .all() as { creator_wallet: string; zero_count: number; total_volume: number }[];
-      for (const r of zaRows) {
-        zeroActivityByCreator.set(r.creator_wallet, {
-          count: r.zero_count ?? 0,
-          totalVolumeUsd: r.total_volume ?? 0,
-        });
+        .all() as {
+          creator_wallet: string;
+          buy_count: number;
+          sell_count: number;
+          volume_usd: number;
+          bonding_curve_progress: number;
+        }[];
+      for (const r of allTokenActivity) {
+        let entry = zeroActivityByCreator.get(r.creator_wallet);
+        if (!entry) {
+          entry = { count: 0, totalVolumeUsd: 0 };
+          zeroActivityByCreator.set(r.creator_wallet, entry);
+        }
+        entry.totalVolumeUsd += r.volume_usd ?? 0;
+        if (!tokenHasActivity({
+          buyCount: r.buy_count,
+          sellCount: r.sell_count,
+          volumeUsd: r.volume_usd,
+          bondingCurveProgress: r.bonding_curve_progress,
+        })) {
+          entry.count++;
+        }
       }
     } catch { /* safeguard */ }
 

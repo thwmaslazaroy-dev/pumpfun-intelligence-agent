@@ -8,6 +8,7 @@ import {
   CreatorSuccessScoreInput,
   CreatorSuccessScoreResult,
   CreatorTierResult,
+  tokenHasActivity,
 } from "../lib/budgeted-watchlist-core";
 
 // ── Row shapes from SQLite ─────────────────────────────────────────────────────
@@ -633,24 +634,43 @@ function main(): void {
       if (w !== null) minBurstWindowSecByCreator.set(wallet, w);
     }
 
-    interface ZeroActivityStats { count: number; totalVolumeUsd: number }
+    // Per-creator zero-activity stats — computed in TypeScript using tokenHasActivity()
+    // so that realActivity=true and zeroFeedActivity can never contradict each other.
+    interface ZeroActivityStats { count: number; totalVolumeUsd: number; activeByBcCount: number }
     const zeroActivityByCreator = new Map<string, ZeroActivityStats>();
     try {
-      const zaRows = db
+      const allTokenActivity = db
         .prepare(
-          `SELECT creator_wallet,
-             SUM(CASE WHEN buy_count = 0 AND sell_count = 0 AND volume_usd <= 0.001
-                      THEN 1 ELSE 0 END) as zero_count,
-             SUM(volume_usd) as total_volume
-           FROM tokens
-           GROUP BY creator_wallet`,
+          "SELECT creator_wallet, buy_count, sell_count, volume_usd, bonding_curve_progress FROM tokens",
         )
-        .all() as { creator_wallet: string; zero_count: number; total_volume: number }[];
-      for (const r of zaRows) {
-        zeroActivityByCreator.set(r.creator_wallet, {
-          count: r.zero_count ?? 0,
-          totalVolumeUsd: r.total_volume ?? 0,
+        .all() as {
+          creator_wallet: string;
+          buy_count: number;
+          sell_count: number;
+          volume_usd: number;
+          bonding_curve_progress: number;
+        }[];
+      for (const r of allTokenActivity) {
+        let entry = zeroActivityByCreator.get(r.creator_wallet);
+        if (!entry) {
+          entry = { count: 0, totalVolumeUsd: 0, activeByBcCount: 0 };
+          zeroActivityByCreator.set(r.creator_wallet, entry);
+        }
+        entry.totalVolumeUsd += r.volume_usd ?? 0;
+        const active = tokenHasActivity({
+          buyCount: r.buy_count,
+          sellCount: r.sell_count,
+          volumeUsd: r.volume_usd,
+          bondingCurveProgress: r.bonding_curve_progress,
         });
+        if (!active) {
+          entry.count++;
+        } else {
+          const bc = r.bonding_curve_progress ?? 0;
+          const bcActive = bc > 1 ? bc > 38 : bc > 0.38;
+          const feedZero = (r.buy_count ?? 0) === 0 && (r.sell_count ?? 0) === 0 && (r.volume_usd ?? 0) <= 0.001;
+          if (bcActive && feedZero) entry.activeByBcCount++;
+        }
       }
     } catch { /* safeguard */ }
 
@@ -733,24 +753,17 @@ function main(): void {
       const score = scoreCreator(cr);
       const ssEntry = successScoreByCreator.get(t.creator_wallet) ?? null;
 
-      // Real activity detection — three complementary signals:
-      //   1. Feed counters (buy_count, sell_count, volume_usd) — direct from Pump.fun feed;
-      //      the created-feed endpoint returns these as 0 for brand-new tokens, so we
-      //      supplement with two proxy signals.
-      //   2. Bonding curve progress above the fresh-token floor: a new Pump.fun token starts
-      //      with ~30 SOL in virtual reserves → bc_progress ≈ 0.353. Any value materially
-      //      above 0.38 (or > 1 if stored as a percentage from an older ingestion path)
-      //      indicates real buying has occurred.
-      //   3. Moralis swap_count (from token_outcomes, already computed as latestSwapCount)
-      //      confirms on-chain swap traffic independent of the feed.
-      const BC_FRESH_FLOOR = 0.38; // tokens start at ~0.353; above this = real buys
+      // Real activity: uses tokenHasActivity() (same helper as zeroFeedActivity calculation)
+      // so realActivity=true and zeroFeedActivity can never contradict each other.
+      // Supplemented by Moralis swap_count from token_outcomes as an independent signal.
       const outcomeSwapCount = m?.latestSwapCount ?? 0;
       const hasRealFeedActivity =
-        t.buy_count > 0 ||
-        t.sell_count > 0 ||
-        t.volume_usd > 0.001 ||
-        t.bonding_curve_progress > BC_FRESH_FLOOR ||
-        outcomeSwapCount > 0;
+        tokenHasActivity({
+          buyCount: t.buy_count,
+          sellCount: t.sell_count,
+          volumeUsd: t.volume_usd,
+          bondingCurveProgress: t.bonding_curve_progress,
+        }) || outcomeSwapCount > 0;
       const isOnBudgetedWatchlist = budgetedMints.has(t.mint);
 
       let { decision, reason, rejectedByMinLaunches } = decide(
@@ -886,11 +899,22 @@ function main(): void {
     process.stdout.write(`  high (60–100): ${ssDist.high}\n`);
 
     // ── Counters ──────────────────────────────────────────────────────────────
+    // Activity diagnostic across all creators
+    let dbgTotalZero = 0;
+    let dbgActiveByBc = 0;
+    for (const s of zeroActivityByCreator.values()) {
+      dbgTotalZero += s.count;
+      dbgActiveByBc += s.activeByBcCount;
+    }
+
     process.stdout.write("\n--- counts ---\n");
     process.stdout.write(`  recentTokensAnalyzed:              ${recentTokens.length}\n`);
     process.stdout.write(`  mintsWithOutcomes:                 ${mintMetricsByMint.size}\n`);
     process.stdout.write(`  creatorsWithOutcomes:              ${creatorRowByWallet.size}\n`);
     process.stdout.write(`  budgetedWatchlistMints:            ${budgetedMints.size}\n`);
+    process.stdout.write("\n--- activity diagnostics (all tokens in DB) ---\n");
+    process.stdout.write(`  zeroActivityCount:                 ${dbgTotalZero}\n`);
+    process.stdout.write(`  activeByBondingCurveCount:         ${dbgActiveByBc}\n`);
     process.stdout.write("\n--- rejection counters ---\n");
     process.stdout.write(`  rejectedSpamCreator:               ${rejectedSpamCreator}\n`);
     process.stdout.write(`  rejectedDeadCreator:               ${rejectedDeadCreator}\n`);

@@ -10,6 +10,7 @@ import {
   CreatorRow,
   CreatorSuccessScoreInput,
   JoinRow,
+  tokenHasActivity,
 } from "../lib/budgeted-watchlist-core";
 
 // ── Row types from SQLite ─────────────────────────────────────────────────────
@@ -20,7 +21,14 @@ interface LaunchStatsRow {
   total_volume: number;
   first_at: number;
   last_at: number;
-  zero_count: number;
+}
+
+interface TokenActivityRow {
+  creator_wallet: string;
+  buy_count: number;
+  sell_count: number;
+  volume_usd: number;
+  bonding_curve_progress: number;
 }
 
 interface TokenDetailRow {
@@ -176,15 +184,14 @@ function main(): void {
     }
 
     // ── 2. Per-creator launch stats from tokens table ─────────────────────────
+    // Launch counts and timestamps (stable identity data)
     const launchStatsRows = db
       .prepare(
         `SELECT creator_wallet,
            COUNT(*) as launches,
            SUM(volume_usd) as total_volume,
            MIN(launched_at) as first_at,
-           MAX(launched_at) as last_at,
-           SUM(CASE WHEN buy_count = 0 AND sell_count = 0 AND volume_usd <= 0.001
-                    THEN 1 ELSE 0 END) as zero_count
+           MAX(launched_at) as last_at
          FROM tokens
          GROUP BY creator_wallet`,
       )
@@ -198,10 +205,30 @@ function main(): void {
       launchStatsByCreator.set(r.creator_wallet, {
         launches: r.launches,
         totalVolumeUsd: r.total_volume ?? 0,
-        zeroActivityCount: r.zero_count ?? 0,
+        zeroActivityCount: 0,   // filled in below using tokenHasActivity()
         firstLaunchAt: r.first_at,
         lastLaunchAt: r.last_at,
       });
+    }
+
+    // Per-token activity — computed via tokenHasActivity() so the definition matches
+    // the per-token realActivity check and contradictions are impossible.
+    const tokenActivityRows = db
+      .prepare(
+        "SELECT creator_wallet, buy_count, sell_count, volume_usd, bonding_curve_progress FROM tokens",
+      )
+      .all() as TokenActivityRow[];
+    for (const r of tokenActivityRows) {
+      const entry = launchStatsByCreator.get(r.creator_wallet);
+      if (!entry) continue;
+      if (!tokenHasActivity({
+        buyCount: r.buy_count,
+        sellCount: r.sell_count,
+        volumeUsd: r.volume_usd,
+        bondingCurveProgress: r.bonding_curve_progress,
+      })) {
+        entry.zeroActivityCount++;
+      }
     }
 
     // ── 3. Burst detection — sorted timestamps per creator ────────────────────

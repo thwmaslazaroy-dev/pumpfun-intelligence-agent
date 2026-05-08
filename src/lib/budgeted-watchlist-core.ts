@@ -605,3 +605,33 @@ export function computeMinBurstWindowSec(sortedTimestampsMs: number[]): number |
   }
   return minMs === Infinity ? null : minMs / 1000;
 }
+
+// ── Per-token activity helper ─────────────────────────────────────────────────
+
+/**
+ * Single source of truth for "does this token show real feed activity?".
+ *
+ * Handles bonding_curve_progress stored as either:
+ *   0–1   (new format, computed from virtual_sol_reserves / 85 SOL)
+ *   0–100 (legacy percentage from older ingestion paths, detected by value > 1)
+ *
+ * Fresh Pump.fun tokens start with ~30 SOL in virtual reserves:
+ *   new format floor  ≈ 0.353  → threshold 0.38
+ *   legacy format floor ≈ 35.3 → threshold 38
+ *
+ * Use this everywhere zero-activity is calculated so that realActivity=true
+ * and zeroFeedActivity can never contradict each other.
+ */
+export function tokenHasActivity(t: {
+  buyCount?: number;
+  sellCount?: number;
+  volumeUsd?: number;
+  bondingCurveProgress?: number;
+}): boolean {
+  if ((t.buyCount ?? 0) > 0) return true;
+  if ((t.sellCount ?? 0) > 0) return true;
+  if ((t.volumeUsd ?? 0) > 0.001) return true;
+  const bc = t.bondingCurveProgress ?? 0;
+  if (bc > 1) return bc > 38;   // legacy 0–100 format: active above 38%
+  return bc > 0.38;              // new 0–1 format: active above 0.38
+}
