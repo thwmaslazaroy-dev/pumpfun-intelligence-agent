@@ -1,7 +1,13 @@
 import Database from "better-sqlite3";
 import * as fs from "fs";
 import * as path from "path";
-import { computeCreatorTier, CreatorTierResult } from "../lib/budgeted-watchlist-core";
+import {
+  computeCreatorSuccessScore,
+  computeCreatorTier,
+  CreatorSuccessScoreInput,
+  CreatorSuccessScoreResult,
+  CreatorTierResult,
+} from "../lib/budgeted-watchlist-core";
 
 interface TokenRow {
   mint: string;
@@ -253,7 +259,16 @@ function decide(
   creatorRow: CreatorRow | null,
   minLaunches: number,
   scoreResult: CreatorScoreResult,
+  successScore: number | undefined,
 ): { decision: Decision; reason: string } {
+  // Rule 0: success score confirms spam / rug farm — hard reject before anything else
+  if (successScore !== undefined && successScore < 20) {
+    return {
+      decision: "REJECT",
+      reason: `rule 0: successScore=${successScore}<20 (confirmed spam/rug pattern)`,
+    };
+  }
+
   if (scoreResult.creatorScore <= -8) {
     return {
       decision: "REJECT",
@@ -309,15 +324,21 @@ function decide(
     tokenLabel !== null && OK_CURRENT_TOKEN_LABELS.has(tokenLabel);
 
   if (eligibleByCreator && tokenOk) {
-    if (scoreResult.creatorScore >= 8 && tokenStrictOk) {
+    // HIGH_PRIORITY_ALERT requires strong creatorScore, confirmed token momentum,
+    // and a successScore >= 45 so borderline spam farms cannot slip through.
+    const successScoreOk = successScore === undefined || successScore >= 45;
+    if (scoreResult.creatorScore >= 8 && tokenStrictOk && successScoreOk) {
       return {
         decision: "HIGH_PRIORITY_ALERT",
-        reason: `rule 6: creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"} creatorScore=${scoreResult.creatorScore}`,
+        reason: `rule 6: creatorLabel=${creatorLabel} positive=${positive} bad=${bad} tokenLabel=${tokenLabel ?? "n/a"} creatorScore=${scoreResult.creatorScore} successScore=${successScore ?? "n/a"}`,
       };
     }
+    const gateBlockReason = !successScoreOk
+      ? `successScore=${successScore}<45`
+      : `creatorScore=${scoreResult.creatorScore}<8 or tokenLabel=${tokenLabel ?? "n/a"} not strict-ok`;
     return {
       decision: "WATCH_ONLY",
-      reason: `rule 6b: high-priority gate not met (creatorScore=${scoreResult.creatorScore}, tokenLabel=${tokenLabel ?? "n/a"}); held at watch-only`,
+      reason: `rule 6b: high-priority gate not met (${gateBlockReason}); held at watch-only`,
     };
   }
 
@@ -349,6 +370,8 @@ interface PreviewRow {
   holderRiskReason: string | null;
   creatorTier: string;
   creatorTierReason: string;
+  successScore: number | null;
+  successScoreReason: string | null;
 }
 
 function decisionRank(d: Decision): number {
@@ -526,15 +549,23 @@ function main(): void {
       creatorRowByWallet.set(row.creatorWallet, row);
     }
 
-    // Total launch count per creator (includes tokens without any outcome rows)
+    // Total launch count + first/last timestamp per creator (includes tokens without outcome rows)
     const launchCountByCreator = new Map<string, number>();
+    const firstLaunchAtByCreator = new Map<string, number>();
+    const lastLaunchAtByCreator = new Map<string, number>();
     try {
       const lcRows = db
         .prepare(
-          "SELECT creator_wallet, COUNT(*) as cnt FROM tokens GROUP BY creator_wallet",
+          `SELECT creator_wallet, COUNT(*) as cnt,
+                  MIN(launched_at) as first_at, MAX(launched_at) as last_at
+           FROM tokens GROUP BY creator_wallet`,
         )
-        .all() as { creator_wallet: string; cnt: number }[];
-      for (const r of lcRows) launchCountByCreator.set(r.creator_wallet, r.cnt);
+        .all() as { creator_wallet: string; cnt: number; first_at: number; last_at: number }[];
+      for (const r of lcRows) {
+        launchCountByCreator.set(r.creator_wallet, r.cnt);
+        firstLaunchAtByCreator.set(r.creator_wallet, r.first_at);
+        lastLaunchAtByCreator.set(r.creator_wallet, r.last_at);
+      }
     } catch {
       // tokens table always exists — this catch is a safeguard only
     }
@@ -556,7 +587,45 @@ function main(): void {
       // holder_risk_evaluations may not exist yet — no EXTREME data
     }
 
-    // Build creator tier map
+    // HIGH holder count per creator
+    const highCountByCreator = new Map<string, number>();
+    try {
+      const highRows = db
+        .prepare(
+          `SELECT t.creator_wallet, COUNT(*) as cnt
+           FROM holder_risk_evaluations h
+           JOIN tokens t ON t.mint = h.mint
+           WHERE h.holder_risk_label = 'HIGH'
+           GROUP BY t.creator_wallet`,
+        )
+        .all() as { creator_wallet: string; cnt: number }[];
+      for (const r of highRows) highCountByCreator.set(r.creator_wallet, r.cnt);
+    } catch {
+      // holder_risk_evaluations may not exist yet
+    }
+
+    // Creator success score — computed before tier so tier can use it
+    const successScoreByCreator = new Map<string, CreatorSuccessScoreResult>();
+    for (const agg of byCreator.values()) {
+      const lc = agg.labelCounts;
+      const ssInput: CreatorSuccessScoreInput = {
+        launches: launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked,
+        launchesTracked: agg.launchesTracked,
+        strongGain: lc.STRONG_GAIN ?? 0,
+        up: lc.UP ?? 0,
+        activeFlat: lc.ACTIVE_FLAT ?? 0,
+        noPrice: lc.NO_PRICE ?? 0,
+        down: lc.DOWN ?? 0,
+        rugLike: lc.RUG_LIKE ?? 0,
+        extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
+        highHolderCount: highCountByCreator.get(agg.creatorWallet) ?? 0,
+        firstLaunchAt: firstLaunchAtByCreator.get(agg.creatorWallet) ?? null,
+        lastLaunchAt: lastLaunchAtByCreator.get(agg.creatorWallet) ?? null,
+      };
+      successScoreByCreator.set(agg.creatorWallet, computeCreatorSuccessScore(ssInput));
+    }
+
+    // Build creator tier map (successScore passed to allow tier upgrades/downgrades)
     const creatorTierByWallet = new Map<string, CreatorTierResult>();
     for (const agg of byCreator.values()) {
       creatorTierByWallet.set(
@@ -566,6 +635,7 @@ function main(): void {
           totalSwaps: agg.totalSwaps,
           pricedRows: agg.pricedRows,
           extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
+          successScore: successScoreByCreator.get(agg.creatorWallet)?.successScore,
         }),
       );
     }
@@ -587,7 +657,8 @@ function main(): void {
       const positive = cr ? cr.strongGain + cr.up + cr.activeFlat : 0;
       const bad = cr ? cr.flat + cr.noPrice + cr.down + cr.rugLike : 0;
       const score = scoreCreator(cr);
-      let { decision, reason } = decide(tokenLabel, cr, minLaunches, score);
+      const ssEntry = successScoreByCreator.get(t.creator_wallet) ?? null;
+      let { decision, reason } = decide(tokenLabel, cr, minLaunches, score, ssEntry?.successScore);
 
       const holderRisk = holderRiskByMint.get(t.mint) ?? null;
       const holderRiskLabel = holderRisk?.label ?? null;
@@ -629,6 +700,8 @@ function main(): void {
         holderRiskReason,
         creatorTier: tierResult.tier,
         creatorTierReason: tierResult.reason,
+        successScore: ssEntry?.successScore ?? null,
+        successScoreReason: ssEntry?.successScoreReason ?? null,
       });
     }
 
@@ -649,6 +722,18 @@ function main(): void {
     for (const p of previews) {
       decisionCounts.set(p.decision, (decisionCounts.get(p.decision) ?? 0) + 1);
     }
+
+    // Success score distribution
+    const ssDist = { low: 0, mid: 0, high: 0 };
+    for (const r of successScoreByCreator.values()) {
+      if (r.successScore < 30) ssDist.low++;
+      else if (r.successScore < 60) ssDist.mid++;
+      else ssDist.high++;
+    }
+    process.stdout.write("\n--- creator success score distribution ---\n");
+    process.stdout.write(`  low  (0–29):   ${ssDist.low}\n`);
+    process.stdout.write(`  mid  (30–59):  ${ssDist.mid}\n`);
+    process.stdout.write(`  high (60–100): ${ssDist.high}\n`);
 
     process.stdout.write("\n--- counts ---\n");
     process.stdout.write(`  recentTokensAnalyzed:   ${recentTokens.length}\n`);
@@ -724,6 +809,9 @@ function main(): void {
         `      creatorTier=${p.creatorTier}  creatorTierReason=${p.creatorTierReason}\n`,
       );
       process.stdout.write(
+        `      successScore=${p.successScore ?? "n/a"}  successScoreReason=${p.successScoreReason ?? "n/a"}\n`,
+      );
+      process.stdout.write(
         `      finalDecision=${p.decision}  reason=${p.reason}\n`,
       );
       idx++;
@@ -752,6 +840,8 @@ function main(): void {
       holderRiskReason: p.holderRiskReason,
       creatorTier: p.creatorTier,
       creatorTierReason: p.creatorTierReason,
+      successScore: p.successScore,
+      successScoreReason: p.successScoreReason,
     }));
     const outPath = path.resolve(
       process.cwd(),

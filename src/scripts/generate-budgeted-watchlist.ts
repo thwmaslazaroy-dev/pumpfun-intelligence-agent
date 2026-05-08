@@ -5,10 +5,13 @@ import {
   BudgetedRejectionReason,
   Candidate,
   CreatorRow,
+  CreatorSuccessScoreInput,
+  CreatorSuccessScoreResult,
   CreatorTierResult,
   JoinRow,
   MintMetrics,
   classifyCreator,
+  computeCreatorSuccessScore,
   computeCreatorTier,
   computeMintMetrics,
   evaluateBudgetedReject,
@@ -178,15 +181,21 @@ function main(): void {
       creatorRowByWallet.set(row.creatorWallet, row);
     }
 
-    // Total launch count per creator (includes mints without any outcome rows)
-    const launchCountRows = db
+    // Total launch count + first/last timestamp per creator (includes mints without outcome rows)
+    const launchInfoRows = db
       .prepare(
-        "SELECT creator_wallet, COUNT(*) as cnt FROM tokens GROUP BY creator_wallet",
+        `SELECT creator_wallet, COUNT(*) as cnt,
+                MIN(launched_at) as first_at, MAX(launched_at) as last_at
+         FROM tokens GROUP BY creator_wallet`,
       )
-      .all() as { creator_wallet: string; cnt: number }[];
+      .all() as { creator_wallet: string; cnt: number; first_at: number; last_at: number }[];
     const launchCountByCreator = new Map<string, number>();
-    for (const r of launchCountRows) {
+    const firstLaunchAtByCreator = new Map<string, number>();
+    const lastLaunchAtByCreator = new Map<string, number>();
+    for (const r of launchInfoRows) {
       launchCountByCreator.set(r.creator_wallet, r.cnt);
+      firstLaunchAtByCreator.set(r.creator_wallet, r.first_at);
+      lastLaunchAtByCreator.set(r.creator_wallet, r.last_at);
     }
 
     // Extreme holder count per creator (table may not exist yet — degrade gracefully)
@@ -208,7 +217,59 @@ function main(): void {
       // holder_risk_evaluations not yet created — no EXTREME data available
     }
 
-    // Build creator tier map
+    // HIGH holder count per creator
+    const highCountByCreator = new Map<string, number>();
+    try {
+      const highRows = db
+        .prepare(
+          `SELECT t.creator_wallet, COUNT(*) as cnt
+           FROM holder_risk_evaluations h
+           JOIN tokens t ON t.mint = h.mint
+           WHERE h.holder_risk_label = 'HIGH'
+           GROUP BY t.creator_wallet`,
+        )
+        .all() as { creator_wallet: string; cnt: number }[];
+      for (const r of highRows) {
+        highCountByCreator.set(r.creator_wallet, r.cnt);
+      }
+    } catch {
+      // holder_risk_evaluations not yet created
+    }
+
+    // Creator success score — computed before tier so tier can use it
+    const successScoreByCreator = new Map<string, CreatorSuccessScoreResult>();
+    for (const agg of byCreator.values()) {
+      const lc = agg.labelCounts;
+      const ssInput: CreatorSuccessScoreInput = {
+        launches: launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked,
+        launchesTracked: agg.launchesTracked,
+        strongGain: lc.STRONG_GAIN ?? 0,
+        up: lc.UP ?? 0,
+        activeFlat: lc.ACTIVE_FLAT ?? 0,
+        noPrice: lc.NO_PRICE ?? 0,
+        down: lc.DOWN ?? 0,
+        rugLike: lc.RUG_LIKE ?? 0,
+        extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
+        highHolderCount: highCountByCreator.get(agg.creatorWallet) ?? 0,
+        firstLaunchAt: firstLaunchAtByCreator.get(agg.creatorWallet) ?? null,
+        lastLaunchAt: lastLaunchAtByCreator.get(agg.creatorWallet) ?? null,
+      };
+      successScoreByCreator.set(agg.creatorWallet, computeCreatorSuccessScore(ssInput));
+    }
+
+    // Success score distribution summary
+    const ssDist = { low: 0, mid: 0, high: 0 };
+    for (const r of successScoreByCreator.values()) {
+      if (r.successScore < 30) ssDist.low++;
+      else if (r.successScore < 60) ssDist.mid++;
+      else ssDist.high++;
+    }
+    process.stdout.write("\n--- creator success score distribution ---\n");
+    process.stdout.write(`  low  (0–29):   ${ssDist.low}\n`);
+    process.stdout.write(`  mid  (30–59):  ${ssDist.mid}\n`);
+    process.stdout.write(`  high (60–100): ${ssDist.high}\n`);
+
+    // Build creator tier map (successScore is passed to allow tier upgrades/downgrades)
     const creatorTierByWallet = new Map<string, CreatorTierResult>();
     for (const agg of byCreator.values()) {
       creatorTierByWallet.set(
@@ -218,6 +279,7 @@ function main(): void {
           totalSwaps: agg.totalSwaps,
           pricedRows: agg.pricedRows,
           extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
+          successScore: successScoreByCreator.get(agg.creatorWallet)?.successScore,
         }),
       );
     }
@@ -296,6 +358,28 @@ function main(): void {
         score += 10;
         breakdown += " tier=ACTIVE_CREATOR(+10)";
       }
+
+      // Success score bonus / penalty
+      const ssResult = successScoreByCreator.get(t.creator_wallet);
+      if (ssResult !== undefined) {
+        const ss = ssResult.successScore;
+        if (ss >= 70) {
+          score += 15;
+          breakdown += ` successScore=${ss}(+15)`;
+        } else if (ss >= 50) {
+          score += 5;
+          breakdown += ` successScore=${ss}(+5)`;
+        } else if (ss < 25) {
+          score -= 20;
+          breakdown += ` successScore=${ss}(-20)`;
+        } else if (ss < 35) {
+          score -= 10;
+          breakdown += ` successScore=${ss}(-10)`;
+        } else {
+          breakdown += ` successScore=${ss}(0)`;
+        }
+      }
+
       candidates.push({ ...partial, score, scoreBreakdown: breakdown });
     }
 
@@ -374,11 +458,15 @@ function main(): void {
         const launchedIso = new Date(c.launchedAt).toISOString();
         const cl = c.creatorRow?.creatorOutcomeLabel ?? "UNKNOWN";
         const tracked = c.creatorRow?.launchesTracked ?? 0;
+        const ssEntry = successScoreByCreator.get(c.creatorWallet);
         process.stdout.write(
           `  [${i}] score=${c.score}  mint=${shorten(c.mint)}  symbol=${c.symbol}  launched=${launchedIso}\n`,
         );
         process.stdout.write(
           `      creator=${shorten(c.creatorWallet)}  creatorLabel=${cl}  tracked=${tracked}  outcomeCount=${c.outcomeCount}\n`,
+        );
+        process.stdout.write(
+          `      successScore=${ssEntry?.successScore ?? "n/a"}  successScoreReason=${ssEntry?.successScoreReason ?? "n/a"}\n`,
         );
         process.stdout.write(`      breakdown=${c.scoreBreakdown}\n`);
         i++;

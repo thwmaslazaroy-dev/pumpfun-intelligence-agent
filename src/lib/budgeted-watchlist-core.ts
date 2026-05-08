@@ -330,14 +330,21 @@ export interface CreatorTierInput {
   pricedRows: number;
   /** Count of this creator's mints with holder_risk_label = EXTREME. */
   extremeHolderCount: number;
+  /** Optional 0–100 success score. When provided, used to boost or penalise tier. */
+  successScore?: number;
 }
 
 export function computeCreatorTier(input: CreatorTierInput): CreatorTierResult {
-  const { launches: l, totalSwaps: sw, pricedRows: pr, extremeHolderCount: ex } = input;
+  const { launches: l, totalSwaps: sw, pricedRows: pr, extremeHolderCount: ex, successScore: ss } = input;
 
   // SPAM: many launches, no swap activity at all
   if (l >= 8 && sw === 0) {
     return { tier: "SPAM_CREATOR", reason: `launches=${l}>=8 totalSwaps=0` };
+  }
+
+  // SPAM: success score confirms spam / rug farm pattern with sufficient evidence
+  if (ss !== undefined && ss < 20 && l >= 5) {
+    return { tier: "SPAM_CREATOR", reason: `successScore=${ss}<20 launches=${l}>=5` };
   }
 
   // DEAD: significant launches, zero price data
@@ -345,11 +352,19 @@ export function computeCreatorTier(input: CreatorTierInput): CreatorTierResult {
     return { tier: "DEAD_CREATOR", reason: `launches=${l}>=5 pricedRows=0` };
   }
 
-  // PROMISING — superset of ACTIVE, check first
+  // PROMISING (structural) — superset of ACTIVE, check first
   if (l >= 5 && sw >= 100 && pr >= 2 && ex === 0) {
     return {
       tier: "PROMISING_CREATOR",
       reason: `launches=${l}>=5 totalSwaps=${sw}>=100 pricedRows=${pr}>=2 extreme=0`,
+    };
+  }
+
+  // PROMISING (success-score driven) — high quality outcomes even with lower structural bar
+  if (ss !== undefined && ss >= 70 && l >= 3 && sw >= 30 && ex === 0) {
+    return {
+      tier: "PROMISING_CREATOR",
+      reason: `successScore=${ss}>=70 launches=${l}>=3 totalSwaps=${sw}>=30 extreme=0`,
     };
   }
 
@@ -363,6 +378,159 @@ export function computeCreatorTier(input: CreatorTierInput): CreatorTierResult {
 
   return {
     tier: "UNKNOWN_CREATOR",
-    reason: `launches=${l} totalSwaps=${sw} pricedRows=${pr} extreme=${ex}`,
+    reason: `launches=${l} totalSwaps=${sw} pricedRows=${pr} extreme=${ex}${ss !== undefined ? ` successScore=${ss}` : ""}`,
+  };
+}
+
+// ── Creator Success Score v1 ───────────────────────────────────────────────────
+
+export interface CreatorSuccessScoreInput {
+  /** Total launches from tokens table (includes mints without outcome rows). */
+  launches: number;
+  /** Launches that have at least one outcome row. */
+  launchesTracked: number;
+  strongGain: number;
+  up: number;
+  activeFlat: number;
+  noPrice: number;
+  down: number;
+  rugLike: number;
+  /** Count of this creator's mints with holder_risk_label = EXTREME. */
+  extremeHolderCount: number;
+  /** Count of this creator's mints with holder_risk_label = HIGH. */
+  highHolderCount: number;
+  /** Unix-ms timestamp of this creator's earliest token launch (from tokens table). */
+  firstLaunchAt: number | null;
+  /** Unix-ms timestamp of this creator's most recent token launch (from tokens table). */
+  lastLaunchAt: number | null;
+}
+
+export interface CreatorSuccessScoreResult {
+  /** 0–100. Higher is better. */
+  successScore: number;
+  successScoreReason: string;
+}
+
+export function computeCreatorSuccessScore(
+  input: CreatorSuccessScoreInput,
+): CreatorSuccessScoreResult {
+  const {
+    launches,
+    launchesTracked,
+    strongGain,
+    up,
+    activeFlat,
+    noPrice,
+    down,
+    rugLike,
+    extremeHolderCount,
+    highHolderCount,
+    firstLaunchAt,
+    lastLaunchAt,
+  } = input;
+
+  const parts: string[] = [];
+  let score = 50;
+
+  // Positive: good outcome labels
+  if (strongGain > 0) {
+    const pts = strongGain * 6;
+    score += pts;
+    parts.push(`STRONG_GAIN×${strongGain}(+${pts})`);
+  }
+  if (up > 0) {
+    const pts = up * 4;
+    score += pts;
+    parts.push(`UP×${up}(+${pts})`);
+  }
+  if (activeFlat > 0) {
+    const pts = activeFlat * 2;
+    score += pts;
+    parts.push(`ACTIVE_FLAT×${activeFlat}(+${pts})`);
+  }
+
+  // Positive: clean holder history across all tracked launches
+  if (extremeHolderCount === 0 && highHolderCount === 0 && launchesTracked >= 2) {
+    score += 5;
+    parts.push("cleanHolders(+5)");
+  }
+
+  // Negative: bad outcome labels
+  if (noPrice > 0) {
+    const pts = noPrice * 3;
+    score -= pts;
+    parts.push(`NO_PRICE×${noPrice}(-${pts})`);
+  }
+  if (down > 0) {
+    const pts = down * 5;
+    score -= pts;
+    parts.push(`DOWN×${down}(-${pts})`);
+  }
+  if (rugLike > 0) {
+    const pts = rugLike * 8;
+    score -= pts;
+    parts.push(`RUG_LIKE×${rugLike}(-${pts})`);
+  }
+
+  // Negative: holder concentration
+  if (extremeHolderCount > 0) {
+    const pts = extremeHolderCount * 6;
+    score -= pts;
+    parts.push(`extremeHolder×${extremeHolderCount}(-${pts})`);
+  }
+  if (highHolderCount > 0) {
+    const pts = highHolderCount * 3;
+    score -= pts;
+    parts.push(`highHolder×${highHolderCount}(-${pts})`);
+  }
+
+  // Negative: spam farm — many launches, almost no positive outcomes
+  const positiveCount = strongGain + up + activeFlat;
+  const positiveRate = launchesTracked > 0 ? positiveCount / launchesTracked : 0;
+  if (launches >= 8 && positiveCount < 2) {
+    score -= 30;
+    parts.push(`spamFarm:${launches}launches<2positive(-30)`);
+  } else if (launches >= 5 && launchesTracked >= 3 && positiveRate < 0.2) {
+    score -= 15;
+    parts.push(`spamPattern:positiveRate=${(positiveRate * 100).toFixed(0)}%(-15)`);
+  }
+
+  // Negative: high NO_PRICE rate (price data never materialised)
+  if (launchesTracked >= 3 && noPrice / launchesTracked >= 0.7) {
+    score -= 15;
+    parts.push(`highNoPriceRate:${noPrice}/${launchesTracked}(-15)`);
+  }
+
+  // Negative: high rug rate
+  if (launchesTracked >= 3 && rugLike / launchesTracked >= 0.4) {
+    score -= 20;
+    parts.push(`highRugRate:${rugLike}/${launchesTracked}(-20)`);
+  }
+
+  // Negative: excessive launch rate (spam factory signal)
+  if (
+    launches >= 5 &&
+    firstLaunchAt !== null &&
+    lastLaunchAt !== null &&
+    lastLaunchAt > firstLaunchAt
+  ) {
+    const spanHours = (lastLaunchAt - firstLaunchAt) / (60 * 60 * 1000);
+    if (spanHours > 0) {
+      const launchesPerHour = launches / spanHours;
+      if (launchesPerHour >= 3) {
+        score -= 25;
+        parts.push(`excessiveLaunchRate:${launchesPerHour.toFixed(1)}/hr(-25)`);
+      } else if (launchesPerHour >= 1) {
+        score -= 10;
+        parts.push(`highLaunchRate:${launchesPerHour.toFixed(1)}/hr(-10)`);
+      }
+    }
+  }
+
+  const finalScore = Math.max(0, Math.min(100, Math.round(score)));
+  if (parts.length === 0) parts.push("baseline=50");
+  return {
+    successScore: finalScore,
+    successScoreReason: `score=${finalScore}; base=50; ${parts.join("; ")}`,
   };
 }
