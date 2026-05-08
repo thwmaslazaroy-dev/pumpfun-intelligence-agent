@@ -733,10 +733,24 @@ function main(): void {
       const score = scoreCreator(cr);
       const ssEntry = successScoreByCreator.get(t.creator_wallet) ?? null;
 
-      // Real feed activity: buy/sell/volume recorded at ingest time from Pump.fun feed.
-      // Distinct from Moralis swap_count in token_outcomes which may lag or differ.
+      // Real activity detection — three complementary signals:
+      //   1. Feed counters (buy_count, sell_count, volume_usd) — direct from Pump.fun feed;
+      //      the created-feed endpoint returns these as 0 for brand-new tokens, so we
+      //      supplement with two proxy signals.
+      //   2. Bonding curve progress above the fresh-token floor: a new Pump.fun token starts
+      //      with ~30 SOL in virtual reserves → bc_progress ≈ 0.353. Any value materially
+      //      above 0.38 (or > 1 if stored as a percentage from an older ingestion path)
+      //      indicates real buying has occurred.
+      //   3. Moralis swap_count (from token_outcomes, already computed as latestSwapCount)
+      //      confirms on-chain swap traffic independent of the feed.
+      const BC_FRESH_FLOOR = 0.38; // tokens start at ~0.353; above this = real buys
+      const outcomeSwapCount = m?.latestSwapCount ?? 0;
       const hasRealFeedActivity =
-        t.buy_count > 0 || t.sell_count > 0 || t.volume_usd > 0.001;
+        t.buy_count > 0 ||
+        t.sell_count > 0 ||
+        t.volume_usd > 0.001 ||
+        t.bonding_curve_progress > BC_FRESH_FLOOR ||
+        outcomeSwapCount > 0;
       const isOnBudgetedWatchlist = budgetedMints.has(t.mint);
 
       let { decision, reason, rejectedByMinLaunches } = decide(

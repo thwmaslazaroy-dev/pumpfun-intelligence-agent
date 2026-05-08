@@ -147,6 +147,67 @@ export class SqliteTokenRepository implements TokenRepository {
       );
   }
 
+  /**
+   * Insert a new token row, or update only the mutable feed metrics if the
+   * mint already exists. Identity fields (creator_wallet, launched_at) are
+   * never overwritten. name/symbol are updated only when the stored value is
+   * empty or "UNKNOWN" and the incoming value is better.
+   *
+   * Returns true if a new row was inserted, false if an existing row was updated.
+   */
+  upsertTokenFeedData(token: TokenLaunch): boolean {
+    const existed = !!this.db
+      .prepare("SELECT 1 FROM tokens WHERE mint = ? LIMIT 1")
+      .get(token.mint);
+
+    this.db
+      .prepare(
+        `INSERT INTO tokens (
+          mint, name, symbol, creator_wallet, launched_at,
+          initial_market_cap_usd, bonding_curve_progress,
+          buy_count, sell_count, volume_usd,
+          social_links_json, inserted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(mint) DO UPDATE SET
+          buy_count              = excluded.buy_count,
+          sell_count             = excluded.sell_count,
+          volume_usd             = excluded.volume_usd,
+          bonding_curve_progress = excluded.bonding_curve_progress,
+          initial_market_cap_usd = excluded.initial_market_cap_usd,
+          social_links_json = CASE
+            WHEN excluded.social_links_json IS NOT NULL
+            THEN excluded.social_links_json
+            ELSE social_links_json
+          END,
+          name = CASE
+            WHEN name IN ('', 'UNKNOWN') AND excluded.name NOT IN ('', 'UNKNOWN')
+            THEN excluded.name
+            ELSE name
+          END,
+          symbol = CASE
+            WHEN symbol IN ('', 'UNKNOWN') AND excluded.symbol NOT IN ('', 'UNKNOWN')
+            THEN excluded.symbol
+            ELSE symbol
+          END`,
+      )
+      .run(
+        token.mint,
+        token.name,
+        token.symbol,
+        token.creatorWallet,
+        token.launchedAt.getTime(),
+        token.initialMarketCapUsd,
+        token.bondingCurveProgress,
+        token.buyCount,
+        token.sellCount,
+        token.volumeUsd,
+        token.socialLinks ? JSON.stringify(token.socialLinks) : null,
+        Date.now(),
+      );
+
+    return !existed;
+  }
+
   async findTokenByMint(mint: string): Promise<TokenLaunch | null> {
     const row = this.db
       .prepare("SELECT * FROM tokens WHERE mint = ?")
