@@ -4,6 +4,7 @@ import * as path from "path";
 import {
   computeCreatorSuccessScore,
   computeCreatorTier,
+  computeMinBurstWindowSec,
   CreatorSuccessScoreInput,
   CreatorSuccessScoreResult,
   CreatorTierResult,
@@ -613,10 +614,55 @@ function main(): void {
       // holder_risk_evaluations may not exist yet
     }
 
+    // Launch timestamps per creator (sorted ascending) — used for burst detection
+    const timestampsByCreator = new Map<string, number[]>();
+    try {
+      const tsRows = db
+        .prepare(
+          "SELECT creator_wallet, launched_at FROM tokens ORDER BY creator_wallet ASC, launched_at ASC",
+        )
+        .all() as { creator_wallet: string; launched_at: number }[];
+      for (const r of tsRows) {
+        let arr = timestampsByCreator.get(r.creator_wallet);
+        if (!arr) { arr = []; timestampsByCreator.set(r.creator_wallet, arr); }
+        arr.push(r.launched_at);
+      }
+    } catch { /* tokens table always exists */ }
+
+    // Min burst window per creator (seconds for any 3 consecutive launches)
+    const minBurstWindowSecByCreator = new Map<string, number>();
+    for (const [wallet, ts] of timestampsByCreator.entries()) {
+      const w = computeMinBurstWindowSec(ts);
+      if (w !== null) minBurstWindowSecByCreator.set(wallet, w);
+    }
+
+    // Per-creator zero-activity and total volume stats (from tokens table)
+    interface ZeroActivityStats { count: number; totalVolumeUsd: number }
+    const zeroActivityByCreator = new Map<string, ZeroActivityStats>();
+    try {
+      const zaRows = db
+        .prepare(
+          `SELECT creator_wallet,
+             SUM(CASE WHEN buy_count = 0 AND sell_count = 0 AND volume_usd <= 0.001
+                      THEN 1 ELSE 0 END) as zero_count,
+             SUM(volume_usd) as total_volume
+           FROM tokens
+           GROUP BY creator_wallet`,
+        )
+        .all() as { creator_wallet: string; zero_count: number; total_volume: number }[];
+      for (const r of zaRows) {
+        zeroActivityByCreator.set(r.creator_wallet, {
+          count: r.zero_count ?? 0,
+          totalVolumeUsd: r.total_volume ?? 0,
+        });
+      }
+    } catch { /* safeguard */ }
+
     // Creator success score — computed before tier so tier can use it
     const successScoreByCreator = new Map<string, CreatorSuccessScoreResult>();
     for (const agg of byCreator.values()) {
       const lc = agg.labelCounts;
+      const za = zeroActivityByCreator.get(agg.creatorWallet);
       const ssInput: CreatorSuccessScoreInput = {
         launches: launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked,
         launchesTracked: agg.launchesTracked,
@@ -630,21 +676,29 @@ function main(): void {
         highHolderCount: highCountByCreator.get(agg.creatorWallet) ?? 0,
         firstLaunchAt: firstLaunchAtByCreator.get(agg.creatorWallet) ?? null,
         lastLaunchAt: lastLaunchAtByCreator.get(agg.creatorWallet) ?? null,
+        minBurstWindowSec: minBurstWindowSecByCreator.get(agg.creatorWallet) ?? null,
+        zeroActivityCount: za?.count ?? 0,
+        totalVolumeUsd: za?.totalVolumeUsd ?? 0,
       };
       successScoreByCreator.set(agg.creatorWallet, computeCreatorSuccessScore(ssInput));
     }
 
-    // Build creator tier map (successScore passed to allow tier upgrades/downgrades)
+    // Build creator tier map (successScore + burst/activity signals passed)
     const creatorTierByWallet = new Map<string, CreatorTierResult>();
     for (const agg of byCreator.values()) {
+      const totalLaunches = launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked;
+      const za = zeroActivityByCreator.get(agg.creatorWallet);
+      const zeroRate = totalLaunches > 0 ? (za?.count ?? 0) / totalLaunches : null;
       creatorTierByWallet.set(
         agg.creatorWallet,
         computeCreatorTier({
-          launches: launchCountByCreator.get(agg.creatorWallet) ?? agg.launchesTracked,
+          launches: totalLaunches,
           totalSwaps: agg.totalSwaps,
           pricedRows: agg.pricedRows,
           extremeHolderCount: extremeCountByCreator.get(agg.creatorWallet) ?? 0,
           successScore: successScoreByCreator.get(agg.creatorWallet)?.successScore,
+          minBurstWindowSec: minBurstWindowSecByCreator.get(agg.creatorWallet) ?? null,
+          zeroActivityRate: zeroRate,
         }),
       );
     }

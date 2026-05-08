@@ -332,10 +332,30 @@ export interface CreatorTierInput {
   extremeHolderCount: number;
   /** Optional 0–100 success score. When provided, used to boost or penalise tier. */
   successScore?: number;
+  /** Smallest window in seconds that contains any 3 consecutive launches; null if < 3 launches. */
+  minBurstWindowSec?: number | null;
+  /** Proportion of launches with buy_count=0, sell_count=0, volume_usd≈0; null if no launches. */
+  zeroActivityRate?: number | null;
 }
 
 export function computeCreatorTier(input: CreatorTierInput): CreatorTierResult {
-  const { launches: l, totalSwaps: sw, pricedRows: pr, extremeHolderCount: ex, successScore: ss } = input;
+  const {
+    launches: l, totalSwaps: sw, pricedRows: pr, extremeHolderCount: ex,
+    successScore: ss, minBurstWindowSec: burst, zeroActivityRate: zar,
+  } = input;
+
+  // SPAM: rapid launch burst — token factory bot signal
+  if (burst !== undefined && burst !== null && burst <= 120 && l >= 3) {
+    return { tier: "SPAM_CREATOR", reason: `launchBurst:${l}launches within ${burst.toFixed(0)}s` };
+  }
+
+  // SPAM: most launches have zero feed activity (no buys/sells/volume)
+  if (zar !== undefined && zar !== null && l >= 5 && zar >= 0.8) {
+    return {
+      tier: "SPAM_CREATOR",
+      reason: `zeroFeedActivity:${Math.round(zar * l)}/${l}launches zero-activity`,
+    };
+  }
 
   // SPAM: many launches, no swap activity at all
   if (l >= 8 && sw === 0) {
@@ -403,6 +423,12 @@ export interface CreatorSuccessScoreInput {
   firstLaunchAt: number | null;
   /** Unix-ms timestamp of this creator's most recent token launch (from tokens table). */
   lastLaunchAt: number | null;
+  /** Smallest window in seconds that contains any 3 consecutive launches; null if < 3 launches. */
+  minBurstWindowSec: number | null;
+  /** Count of this creator's tokens with buy_count=0, sell_count=0, volume_usd≈0. */
+  zeroActivityCount: number;
+  /** Sum of volume_usd across all this creator's tokens (from tokens table). */
+  totalVolumeUsd: number;
 }
 
 export interface CreatorSuccessScoreResult {
@@ -427,6 +453,9 @@ export function computeCreatorSuccessScore(
     highHolderCount,
     firstLaunchAt,
     lastLaunchAt,
+    minBurstWindowSec,
+    zeroActivityCount,
+    totalVolumeUsd,
   } = input;
 
   const parts: string[] = [];
@@ -527,10 +556,52 @@ export function computeCreatorSuccessScore(
     }
   }
 
+  // Negative: rapid launch burst (token factory bot signal)
+  if (minBurstWindowSec !== null && minBurstWindowSec <= 120 && launches >= 3) {
+    score -= 30;
+    parts.push(`launchBurst:${launches}launches_within_${minBurstWindowSec.toFixed(0)}s(-30)`);
+  }
+
+  // Negative: majority of tokens have zero feed activity (buy=0, sell=0, volume=0)
+  const zeroRate = launches > 0 ? zeroActivityCount / launches : 0;
+  if (launches >= 5 && zeroRate >= 0.8) {
+    score -= 20;
+    parts.push(`zeroFeedActivity:${zeroActivityCount}/${launches}zero(-20)`);
+  }
+
+  // Negative: mass launches within 2 hours with near-zero total volume
+  if (
+    launches >= 10 &&
+    totalVolumeUsd <= 1.0 &&
+    firstLaunchAt !== null &&
+    lastLaunchAt !== null &&
+    lastLaunchAt - firstLaunchAt <= 2 * 60 * 60 * 1000
+  ) {
+    score -= 30;
+    parts.push(`massLaunch+zeroVolume:${launches}launches_vol=$${totalVolumeUsd.toFixed(2)}_within2hr(-30)`);
+  }
+
   const finalScore = Math.max(0, Math.min(100, Math.round(score)));
   if (parts.length === 0) parts.push("baseline=50");
   return {
     successScore: finalScore,
     successScoreReason: `score=${finalScore}; base=50; ${parts.join("; ")}`,
   };
+}
+
+// ── Burst detection utility ───────────────────────────────────────────────────
+
+/**
+ * Given timestamps (ms, sorted ascending) for one creator's launches,
+ * returns the smallest window in seconds that contains any 3 consecutive
+ * launches, or null if there are fewer than 3 launches.
+ */
+export function computeMinBurstWindowSec(sortedTimestampsMs: number[]): number | null {
+  if (sortedTimestampsMs.length < 3) return null;
+  let minMs = Infinity;
+  for (let i = 0; i <= sortedTimestampsMs.length - 3; i++) {
+    const span = sortedTimestampsMs[i + 2] - sortedTimestampsMs[i];
+    if (span < minMs) minMs = span;
+  }
+  return minMs === Infinity ? null : minMs / 1000;
 }
