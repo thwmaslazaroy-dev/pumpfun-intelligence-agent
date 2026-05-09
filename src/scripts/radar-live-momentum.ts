@@ -41,6 +41,7 @@ interface PumpPortalMessage {
 
 const tokens = new Map<string, TokenState>();
 const alerted = new Set<string>();
+let totalEvents = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -143,9 +144,11 @@ async function sendDiscordAlert(state: TokenState): Promise<void> {
 async function evaluate(): Promise<void> {
   const now = Date.now();
 
+  // Prune expired tokens and clear them from alerted to prevent unbounded growth
   for (const [mint, state] of tokens) {
     if (now - state.firstSeenAt > TOKEN_MAX_AGE_MS) {
       tokens.delete(mint);
+      alerted.delete(mint);
     }
   }
 
@@ -165,7 +168,7 @@ async function evaluate(): Promise<void> {
     sent += 1;
   }
 
-  log("eval tick", { tracked: tokens.size, alerted: alerted.size, sent });
+  log("eval tick", { tracked: tokens.size, alerted: alerted.size, totalEvents, sent });
 }
 
 // ── Event handler ─────────────────────────────────────────────────────────────
@@ -213,7 +216,13 @@ function handleMessage(raw: string): void {
     const buyer = asStr(msg.traderPublicKey);
     if (buyer) state.uniqueBuyers.add(buyer);
     state.buyTimestamps.push(now);
+    // Cap array to avoid unbounded growth for very active tokens
+    if (state.buyTimestamps.length > 500) {
+      state.buyTimestamps = state.buyTimestamps.slice(-500);
+    }
   }
+
+  totalEvents += 1;
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
