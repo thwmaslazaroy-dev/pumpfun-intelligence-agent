@@ -150,6 +150,19 @@ CREATE TABLE IF NOT EXISTS holder_risk_evaluations (
   top10_holder_percent REAL,
   evaluated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS momentum_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mint TEXT NOT NULL,
+  captured_at INTEGER NOT NULL,
+  bonding_curve_progress REAL NOT NULL,
+  buy_count INTEGER NOT NULL,
+  sell_count INTEGER NOT NULL,
+  volume_usd REAL NOT NULL,
+  market_cap_usd REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_momentum_mint_time ON momentum_snapshots(mint, captured_at DESC);
 `;
 
 let db: Database.Database | null = null;

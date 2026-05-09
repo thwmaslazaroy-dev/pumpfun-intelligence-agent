@@ -37,7 +37,8 @@
     "probe:pumpfun:feed": "tsx src/scripts/probe-pumpfun-created-feed.ts",
     "radar:fetch:pumpfun:created-feed": "tsx src/scripts/radar-fetch-pumpfun-created-feed.ts",
     "evaluate:holder-risk": "tsx src/scripts/evaluate-holder-risk.ts",
-    "report:creator-candidates": "tsx src/scripts/report-creator-candidates.ts"
+    "report:creator-candidates": "tsx src/scripts/report-creator-candidates.ts",
+    "monitor:momentum": "tsx src/scripts/monitor-momentum.ts"
   },
   "keywords": [
     "pumpfun",

@@ -10,3 +10,8 @@ export {
   DEFAULT_COMBINED_SCORING_WEIGHTS,
 } from "./combined-scoring-service";
 export type { CombinedScoringWeights } from "./combined-scoring-service";
+export {
+  MomentumDetectionService,
+  DEFAULT_MOMENTUM_THRESHOLDS,
+} from "./momentum-detection-service";
+export type { MomentumThresholds, MomentumSnapshot, MomentumSignals } from "./momentum-detection-service";

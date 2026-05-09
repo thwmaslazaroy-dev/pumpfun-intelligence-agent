@@ -32,6 +32,12 @@ export interface AppConfig {
   outcomeTestTokenMint: string;
   outcomeWatchlistPath: string;
   outcomeBatchDelayMs: number;
+  momentumPollIntervalSeconds: number;
+  momentumTokenMaxAgeHours: number;
+  momentumMinCombinedScore: number;
+  momentumBcVelocityPerMin: number;
+  momentumMinBuyPressure: number;
+  momentumMinNewBuys: number;
 }
 
 function read(name: string, fallback = ""): string {
@@ -107,4 +113,20 @@ export const config: AppConfig = {
   outcomeTestTokenMint: read("OUTCOME_TEST_TOKEN_MINT"),
   outcomeWatchlistPath: read("OUTCOME_WATCHLIST_PATH", "./data/watchlist-mints.txt"),
   outcomeBatchDelayMs: readInt("OUTCOME_BATCH_DELAY_MS", 500),
+  momentumPollIntervalSeconds: readInt("MOMENTUM_POLL_INTERVAL_SECONDS", 60),
+  momentumTokenMaxAgeHours: readInt("MOMENTUM_TOKEN_MAX_AGE_HOURS", 4),
+  momentumMinCombinedScore: readInt("MOMENTUM_MIN_COMBINED_SCORE", 40),
+  momentumBcVelocityPerMin: (() => {
+    const raw = process.env["MOMENTUM_BC_VELOCITY_PER_MIN"];
+    if (!raw) return 0.02;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) ? n : 0.02;
+  })(),
+  momentumMinBuyPressure: (() => {
+    const raw = process.env["MOMENTUM_MIN_BUY_PRESSURE"];
+    if (!raw) return 0.65;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) ? n : 0.65;
+  })(),
+  momentumMinNewBuys: readInt("MOMENTUM_MIN_NEW_BUYS", 3),
 };
