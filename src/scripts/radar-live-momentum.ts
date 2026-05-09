@@ -42,6 +42,8 @@ interface PumpPortalMessage {
 const tokens = new Map<string, TokenState>();
 const alerted = new Set<string>();
 let totalEvents = 0;
+let rawMessages = 0;      // every frame from WS, before any parsing
+let tradeEvents = 0;      // buy or sell events successfully parsed
 let currentWs: WebSocket | null = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -66,6 +68,11 @@ function log(msg: string, extra?: Record<string, unknown>): void {
 function sendWs(payload: object): void {
   if (currentWs && currentWs.readyState === WebSocket.OPEN) {
     currentWs.send(JSON.stringify(payload));
+    log("[WS-SEND]", payload as Record<string, unknown>);
+  } else {
+    log("[WS-SEND FAILED] socket not open", {
+      readyState: currentWs?.readyState ?? "null",
+    });
   }
 }
 
@@ -176,12 +183,21 @@ async function evaluate(): Promise<void> {
     sent += 1;
   }
 
-  log("eval tick", { tracked: tokens.size, alerted: alerted.size, totalEvents, sent });
+  log("eval tick", { tracked: tokens.size, alerted: alerted.size, rawMessages, totalEvents, tradeEvents, sent });
 }
 
 // ── Event handler ─────────────────────────────────────────────────────────────
 
 function handleMessage(raw: string): void {
+  rawMessages += 1;
+
+  // Log every raw frame for the first 20, then every 500th — so we can see
+  // the actual message shapes arriving from pumpportal (including server acks,
+  // error responses, and whether trade events have a 'mint' field).
+  if (rawMessages <= 20 || rawMessages % 500 === 0) {
+    log("[RAW]", { n: rawMessages, frame: raw.slice(0, 200) });
+  }
+
   let msg: PumpPortalMessage;
   try {
     msg = JSON.parse(raw) as PumpPortalMessage;
@@ -190,7 +206,14 @@ function handleMessage(raw: string): void {
   }
 
   const mint = asStr(msg.mint);
-  if (!mint) return;
+  if (!mint) {
+    // Log server messages that have no mint — catches acks, errors, and
+    // subscription confirmations so we know what pumpportal sends back.
+    if (rawMessages <= 20) {
+      log("[NO-MINT]", { frame: raw.slice(0, 200) });
+    }
+    return;
+  }
 
   const now = Date.now();
   const txType = asStr(msg.txType);
@@ -224,13 +247,16 @@ function handleMessage(raw: string): void {
   if (symbol !== "UNKNOWN" && state.symbol === "UNKNOWN") state.symbol = symbol;
   if (name !== "Unknown" && state.name === "Unknown") state.name = name;
 
-  if (txType === "buy") {
-    const buyer = asStr(msg.traderPublicKey);
-    if (buyer) state.uniqueBuyers.add(buyer);
-    state.buyTimestamps.push(now);
-    // Cap array to avoid unbounded growth for very active tokens
-    if (state.buyTimestamps.length > 500) {
-      state.buyTimestamps = state.buyTimestamps.slice(-500);
+  if (txType === "buy" || txType === "sell") {
+    tradeEvents += 1;
+    log("[TRADE]", { mint: mint.slice(0, 8), txType, marketCapSol });
+    if (txType === "buy") {
+      const buyer = asStr(msg.traderPublicKey);
+      if (buyer) state.uniqueBuyers.add(buyer);
+      state.buyTimestamps.push(now);
+      if (state.buyTimestamps.length > 500) {
+        state.buyTimestamps = state.buyTimestamps.slice(-500);
+      }
     }
   }
 
