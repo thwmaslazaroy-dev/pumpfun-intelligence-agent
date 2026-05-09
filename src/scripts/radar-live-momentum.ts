@@ -42,6 +42,7 @@ interface PumpPortalMessage {
 const tokens = new Map<string, TokenState>();
 const alerted = new Set<string>();
 let totalEvents = 0;
+let currentWs: WebSocket | null = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,12 @@ function distinctBuyIntervals(timestamps: number[]): number {
 function log(msg: string, extra?: Record<string, unknown>): void {
   const line = extra ? `${msg} ${JSON.stringify(extra)}` : msg;
   process.stdout.write(`[${new Date().toISOString()}] ${line}\n`);
+}
+
+function sendWs(payload: object): void {
+  if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+    currentWs.send(JSON.stringify(payload));
+  }
 }
 
 function asStr(v: unknown): string | undefined {
@@ -144,11 +151,12 @@ async function sendDiscordAlert(state: TokenState): Promise<void> {
 async function evaluate(): Promise<void> {
   const now = Date.now();
 
-  // Prune expired tokens and clear them from alerted to prevent unbounded growth
+  // Prune expired tokens, clear alerted entry, and unsubscribe from their trades
   for (const [mint, state] of tokens) {
     if (now - state.firstSeenAt > TOKEN_MAX_AGE_MS) {
       tokens.delete(mint);
       alerted.delete(mint);
+      sendWs({ method: "unsubscribeTokenTrade", keys: [mint] });
     }
   }
 
@@ -201,6 +209,10 @@ function handleMessage(raw: string): void {
       marketCapSol,
       bondingCurveProgress: bcProgress(marketCapSol),
     });
+    // Subscribe to trade events for this specific token.
+    // pumpportal requires explicit mint keys — a global subscribeTokenTrade
+    // without keys receives nothing.
+    sendWs({ method: "subscribeTokenTrade", keys: [mint] });
   }
 
   const state = tokens.get(mint)!;
@@ -233,9 +245,11 @@ function connect(): void {
   const ws = new WebSocket(PUMPPORTAL_WS_URL);
 
   ws.on("open", () => {
-    log("connected — subscribing to new tokens and trades");
+    currentWs = ws;
+    log("connected — subscribing to new token creations");
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
-    ws.send(JSON.stringify({ method: "subscribeTokenTrade" }));
+    // Trade subscriptions are sent per-mint as new tokens arrive.
+    // A global subscribeTokenTrade without keys receives nothing.
   });
 
   ws.on("message", (data: WebSocket.RawData) => {
@@ -243,6 +257,7 @@ function connect(): void {
   });
 
   ws.on("close", (code: number, reason: Buffer) => {
+    if (currentWs === ws) currentWs = null;
     log("disconnected — reconnecting in 5s", { code, reason: reason.toString() });
     setTimeout(connect, RECONNECT_DELAY_MS);
   });
