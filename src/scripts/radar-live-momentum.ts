@@ -18,9 +18,10 @@ const QUEUE_BATCH_SIZE = 3;
 const TX_FETCH_DELAY_MS = 250;
 
 // Alert thresholds
-const MIN_TOKEN_AGE_MIN = 10;
-const MAX_TOKEN_AGE_MIN = 120;
-const MIN_UNIQUE_BUYERS = 10;
+const MIN_TOKEN_AGE_MIN = 2;
+const MAX_TOKEN_AGE_MIN = 15;
+const MIN_UNIQUE_BUYERS = 15;
+const MAX_UNIQUE_BUYERS = 80;
 const MIN_BUY_INTERVALS = 2;
 
 // Program IDs / sysvar addresses that are never buyer wallets
@@ -314,6 +315,7 @@ async function evaluate(): Promise<void> {
     const ageMin = (now - state.firstSeenAt) / 60_000;
     if (ageMin < MIN_TOKEN_AGE_MIN || ageMin > MAX_TOKEN_AGE_MIN) continue;
     if (state.uniqueBuyers.size < MIN_UNIQUE_BUYERS) continue;
+    if (state.uniqueBuyers.size > MAX_UNIQUE_BUYERS) continue;
     if (distinctBuyIntervals(state.buyTimestamps) < MIN_BUY_INTERVALS) continue;
 
     alerted.add(mint);
