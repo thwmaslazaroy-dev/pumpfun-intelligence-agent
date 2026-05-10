@@ -1,25 +1,12 @@
 import { createHash } from "crypto";
 import WebSocket from "ws";
 import { config } from "../config";
-import {
-  PumpFunTransactionParser,
-  RawTransactionLine,
-} from "../parsing/pumpfun-transaction-parser";
-import { ParsedPumpFunTransaction } from "../types";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const EVAL_INTERVAL_MS = 60_000;
 const RECONNECT_DELAY_MS = 5_000;
 const TOKEN_MAX_AGE_MS = 3 * 60 * 60 * 1000;
-
-// Only CREATE events hit HTTP; process at most 1 per tick to stay within limits
-const QUEUE_TICK_MS = 2_000;
-const QUEUE_BATCH_SIZE = 1;
-const TX_FETCH_DELAY_MS = 2_000;
-
-// Exponential backoff ceiling when Helius returns 429
-const MAX_BACKOFF_MS = 30_000;
 
 // Alert thresholds
 const MIN_TOKEN_AGE_MIN = 2;
@@ -28,8 +15,13 @@ const MIN_UNIQUE_BUYERS = 15;
 const MAX_UNIQUE_BUYERS = 80;
 const MIN_BUY_INTERVALS = 2;
 
-// Anchor event discriminant: sha256("event:TradeEvent")[0..8]
-// BUY events are resolved directly from this log data — no HTTP fetch needed.
+// Anchor event discriminants: sha256("event:<Name>")[0..8]
+// No HTTP fetches — all data is extracted directly from WebSocket Program data logs.
+const CREATE_EVENT_DISC = createHash("sha256")
+  .update("event:CreateEvent")
+  .digest()
+  .subarray(0, 8);
+
 const TRADE_EVENT_DISC = createHash("sha256")
   .update("event:TradeEvent")
   .digest()
@@ -41,37 +33,27 @@ const BASE58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
 
 interface TokenState {
   mint: string;
+  name: string;
   symbol: string;
   firstSeenAt: number;
   uniqueBuyers: Set<string>;
   buyTimestamps: number[];
 }
 
-// Only CREATE events are queued for HTTP fetch
-interface QueuedSig {
-  signature: string;
-  slot: number;
-}
-
 // ── In-memory state ───────────────────────────────────────────────────────────
 
 const tokens = new Map<string, TokenState>();
 const alerted = new Set<string>();
-const queue: QueuedSig[] = [];
 let currentWs: WebSocket | null = null;
-let parser: PumpFunTransactionParser | null = null;
 
 // diagnostic counters
 let rawMessages = 0;
 let createEvents = 0;
+let createLogHits = 0;
+let createLogMisses = 0;
 let buyEvents = 0;
-let buyLogHits = 0;   // BUY events resolved from Program data (no HTTP)
-let buyLogMisses = 0; // BUY events where log parsing failed (skipped)
-let fetchAttempts = 0;
-let fetchMisses = 0;
-
-// Exponential backoff state for Helius HTTP rate limiting
-let rateLimitBackoffMs = 0;
+let buyLogHits = 0;
+let buyLogMisses = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -86,10 +68,6 @@ function get5MinBucket(ts: number): number {
 
 function distinctBuyIntervals(timestamps: number[]): number {
   return new Set(timestamps.map(get5MinBucket)).size;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 function detectEventType(logs: string[]): "create" | "buy" | "sell" | null {
@@ -118,10 +96,57 @@ function base58Encode(bytes: Uint8Array): string {
   return result;
 }
 
-// Parse pump.fun's Anchor TradeEvent from "Program data: <base64>" log lines.
-// TradeEvent layout (Borsh, after 8-byte discriminant):
+function discMatches(buf: Buffer, disc: Uint8Array): boolean {
+  if (buf.length < 8) return false;
+  for (let i = 0; i < 8; i++) {
+    if (buf[i] !== disc[i]) return false;
+  }
+  return true;
+}
+
+// Parse pump.fun CreateEvent from "Program data: <base64>" log lines.
+// Layout (Borsh after 8-byte discriminant):
+//   name: string (u32 len + bytes)
+//   symbol: string (u32 len + bytes)
+//   uri: string (u32 len + bytes)
+//   mint: Pubkey (32 bytes)
+//   bondingCurve: Pubkey (32 bytes)
+//   user: Pubkey (32 bytes)
+function extractCreateEventFromLogs(
+  logs: string[],
+): { mint: string; name: string; symbol: string } | null {
+  for (const line of logs) {
+    if (!line.startsWith("Program data: ")) continue;
+    const b64 = line.slice("Program data: ".length).trim();
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(b64, "base64");
+    } catch {
+      continue;
+    }
+    if (!discMatches(buf, CREATE_EVENT_DISC)) continue;
+    try {
+      let offset = 8;
+      const nameLen = buf.readUInt32LE(offset); offset += 4;
+      const name = buf.subarray(offset, offset + nameLen).toString("utf8"); offset += nameLen;
+      const symbolLen = buf.readUInt32LE(offset); offset += 4;
+      const symbol = buf.subarray(offset, offset + symbolLen).toString("utf8"); offset += symbolLen;
+      const uriLen = buf.readUInt32LE(offset); offset += 4;
+      offset += uriLen;
+      if (offset + 32 > buf.length) continue;
+      const mint = base58Encode(buf.subarray(offset, offset + 32));
+      return { mint, name, symbol };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+// Parse pump.fun TradeEvent from "Program data: <base64>" log lines.
+// Layout (Borsh after 8-byte discriminant):
 //   mint[32] solAmount[8] tokenAmount[8] isBuy[1] user[32] timestamp[8] ...
-// Total: 113 bytes. No HTTP fetch required.
+// Total: 113 bytes minimum.
 function extractTradeEventFromLogs(
   logs: string[],
 ): { mint: string; buyer: string; isBuy: boolean } | null {
@@ -135,14 +160,7 @@ function extractTradeEventFromLogs(
       continue;
     }
     if (buf.length < 113) continue;
-    let match = true;
-    for (let i = 0; i < 8; i++) {
-      if (buf[i] !== TRADE_EVENT_DISC[i]) {
-        match = false;
-        break;
-      }
-    }
-    if (!match) continue;
+    if (!discMatches(buf, TRADE_EVENT_DISC)) continue;
     return {
       mint: base58Encode(buf.subarray(8, 40)),
       isBuy: buf[56] === 1,
@@ -152,81 +170,23 @@ function extractTradeEventFromLogs(
   return null;
 }
 
-// ── HTTP RPC ──────────────────────────────────────────────────────────────────
+// ── Event handlers ────────────────────────────────────────────────────────────
 
-async function fetchTransaction(signature: string): Promise<unknown | null> {
-  const url = config.solanaRpcHttpUrl;
-  if (!url) return null;
-
-  if (rateLimitBackoffMs > 0) {
-    log("[BACKOFF]", { waitMs: rateLimitBackoffMs });
-    await sleep(rateLimitBackoffMs);
-  }
-
-  fetchAttempts += 1;
-  const body = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "getTransaction",
-    params: [
-      signature,
-      { encoding: "jsonParsed", maxSupportedTransactionVersion: 0, commitment: "confirmed" },
-    ],
-  });
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      signal: controller.signal,
-    });
-    if (res.status === 429) {
-      rateLimitBackoffMs =
-        rateLimitBackoffMs === 0 ? 2_000 : Math.min(rateLimitBackoffMs * 2, MAX_BACKOFF_MS);
-      log("[RATE-LIMITED]", { backoffMs: rateLimitBackoffMs });
-      fetchMisses += 1;
-      return null;
-    }
-    if (!res.ok) {
-      fetchMisses += 1;
-      return null;
-    }
-    const json = (await res.json()) as { result?: unknown };
-    if (!json.result) {
-      fetchMisses += 1;
-    } else if (rateLimitBackoffMs > 0) {
-      rateLimitBackoffMs = Math.max(0, rateLimitBackoffMs - 1_000);
-    }
-    return json.result ?? null;
-  } catch {
-    fetchMisses += 1;
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ── Transaction processing ────────────────────────────────────────────────────
-
-function handleCreate(parsed: ParsedPumpFunTransaction): void {
-  const mint = parsed.candidateMints[0];
-  if (!mint || tokens.has(mint)) return;
-
+function handleCreate(mint: string, name: string, symbol: string): void {
+  if (tokens.has(mint)) return;
   tokens.set(mint, {
     mint,
-    symbol: "UNKNOWN",
+    name,
+    symbol,
     firstSeenAt: Date.now(),
     uniqueBuyers: new Set(),
     buyTimestamps: [],
   });
   createEvents += 1;
-  log("[CREATE]", { mint: mint.slice(0, 8) + "…", tracked: tokens.size });
+  log("[CREATE]", { mint: mint.slice(0, 8) + "…", name, symbol, tracked: tokens.size });
 }
 
-function handleBuyDirect(mint: string, buyer: string): void {
+function handleBuy(mint: string, buyer: string): void {
   const state = tokens.get(mint);
   if (!state) return;
 
@@ -245,45 +205,6 @@ function handleBuyDirect(mint: string, buyer: string): void {
   });
 }
 
-async function processQueuedCreate(item: QueuedSig): Promise<void> {
-  if (!parser) return;
-
-  const txData = await fetchTransaction(item.signature);
-  if (txData === null) return;
-
-  const raw: RawTransactionLine = {
-    fetchedAt: new Date().toISOString(),
-    signature: item.signature,
-    slot: item.slot,
-    blockTime: null,
-    confirmationStatus: "confirmed",
-    signatureErr: null,
-    transaction: txData,
-  };
-
-  let parsed: ParsedPumpFunTransaction;
-  try {
-    parsed = parser.parse(raw);
-  } catch (err) {
-    log("[PARSE-ERR]", { error: String(err) });
-    return;
-  }
-
-  handleCreate(parsed);
-}
-
-// ── Queue processor (runs every QUEUE_TICK_MS) ────────────────────────────────
-
-async function processQueue(): Promise<void> {
-  if (queue.length === 0) return;
-
-  const batch = queue.splice(0, QUEUE_BATCH_SIZE);
-  for (let i = 0; i < batch.length; i++) {
-    await processQueuedCreate(batch[i]);
-    if (i < batch.length - 1) await sleep(TX_FETCH_DELAY_MS);
-  }
-}
-
 // ── Discord alert ─────────────────────────────────────────────────────────────
 
 async function sendDiscordAlert(state: TokenState): Promise<void> {
@@ -298,6 +219,7 @@ async function sendDiscordAlert(state: TokenState): Promise<void> {
         color: 0xfee75c,
         fields: [
           { name: "📍 Mint", value: `\`${state.mint}\``, inline: false },
+          { name: "🏷 Name", value: state.name || "Unknown", inline: true },
           { name: "⏱ Age", value: `${ageMin} minutes`, inline: true },
           { name: "👥 Unique buyers", value: String(state.uniqueBuyers.size), inline: true },
           {
@@ -373,13 +295,11 @@ async function evaluate(): Promise<void> {
     alerted: alerted.size,
     rawWsMessages: rawMessages,
     createEvents,
+    createLogHits,
+    createLogMisses,
     buyEvents,
     buyLogHits,
     buyLogMisses,
-    fetchAttempts,
-    fetchMisses,
-    rateLimitBackoffMs,
-    queuePending: queue.length,
     sent,
   });
 }
@@ -420,11 +340,9 @@ function handleWsMessage(raw: string): void {
 
   const result = msg.params?.result;
   const value = result?.value;
-  const slot = typeof result?.context?.slot === "number" ? result.context.slot : 0;
 
   if (typeof value?.signature !== "string" || value.err != null) return;
 
-  const signature = value.signature;
   const rawLogs = value.logs;
   const logs: string[] = Array.isArray(rawLogs)
     ? rawLogs.filter((l): l is string => typeof l === "string")
@@ -433,26 +351,25 @@ function handleWsMessage(raw: string): void {
   const eventType = detectEventType(logs);
   if (eventType === null || eventType === "sell") return;
 
-  if (eventType === "buy") {
-    // Resolve BUY events directly from the Anchor TradeEvent in Program data logs.
-    // This avoids all HTTP fetches for buys, which are ~99% of events.
-    const trade = extractTradeEventFromLogs(logs);
-    if (trade && trade.isBuy) {
-      buyLogHits += 1;
-      handleBuyDirect(trade.mint, trade.buyer);
+  if (eventType === "create") {
+    const event = extractCreateEventFromLogs(logs);
+    if (event) {
+      createLogHits += 1;
+      handleCreate(event.mint, event.name, event.symbol);
     } else {
-      buyLogMisses += 1;
+      createLogMisses += 1;
     }
     return;
   }
 
-  // CREATE: queue for HTTP fetch (low volume, mint requires full transaction)
-  if (queue.some((q) => q.signature === signature)) return;
-  if (queue.length >= 500) {
-    queue.shift();
+  // eventType === "buy"
+  const trade = extractTradeEventFromLogs(logs);
+  if (trade && trade.isBuy) {
+    buyLogHits += 1;
+    handleBuy(trade.mint, trade.buyer);
+  } else {
+    buyLogMisses += 1;
   }
-  queue.push({ signature, slot });
-  log("[QUEUED-CREATE]", { sig: signature.slice(0, 12) + "…", qLen: queue.length });
 }
 
 // ── WebSocket connection ───────────────────────────────────────────────────────
@@ -498,29 +415,21 @@ function connect(): void {
 function main(): void {
   const programId = config.pumpfunProgramId;
   const wsUrl = config.solanaRpcWsUrl;
-  const httpUrl = config.solanaRpcHttpUrl;
 
-  if (!wsUrl || !programId || !httpUrl) {
-    log("ERROR: SOLANA_RPC_WS_URL, SOLANA_RPC_HTTP_URL, and PUMPFUN_PROGRAM_ID must be set in .env");
+  if (!wsUrl || !programId) {
+    log("ERROR: SOLANA_RPC_WS_URL and PUMPFUN_PROGRAM_ID must be set in .env");
     process.exit(1);
   }
 
-  parser = new PumpFunTransactionParser(programId);
-
-  log("[STARTING] radar:live:momentum (Helius/QuikNode logsSubscribe)", {
+  log("[STARTING] radar:live:momentum (zero-HTTP, WebSocket-only)", {
     minUniqueBuyers: MIN_UNIQUE_BUYERS,
     minBuyIntervals: MIN_BUY_INTERVALS,
     minTokenAgeMin: MIN_TOKEN_AGE_MIN,
     maxTokenAgeMin: MAX_TOKEN_AGE_MIN,
     webhookConfigured: Boolean(config.discordWebhookUrl),
-    httpUrl: httpUrl.slice(0, 40) + "…",
   });
 
   connect();
-
-  setInterval(() => {
-    processQueue().catch((err: Error) => log("[QUEUE-ERR]", { error: err.message }));
-  }, QUEUE_TICK_MS);
 
   setInterval(() => {
     evaluate().catch((err: Error) => log("[EVAL-ERR]", { error: err.message }));
