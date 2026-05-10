@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import WebSocket from "ws";
 import { config } from "../config";
 import {
@@ -12,10 +13,13 @@ const EVAL_INTERVAL_MS = 60_000;
 const RECONNECT_DELAY_MS = 5_000;
 const TOKEN_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 
-// Throttle HTTP RPC fetches to stay well within QuikNode rate limits
-const QUEUE_TICK_MS = 1_000;
-const QUEUE_BATCH_SIZE = 3;
-const TX_FETCH_DELAY_MS = 250;
+// Only CREATE events hit HTTP; process at most 1 per tick to stay within limits
+const QUEUE_TICK_MS = 2_000;
+const QUEUE_BATCH_SIZE = 1;
+const TX_FETCH_DELAY_MS = 2_000;
+
+// Exponential backoff ceiling when Helius returns 429
+const MAX_BACKOFF_MS = 30_000;
 
 // Alert thresholds
 const MIN_TOKEN_AGE_MIN = 2;
@@ -24,18 +28,14 @@ const MIN_UNIQUE_BUYERS = 15;
 const MAX_UNIQUE_BUYERS = 80;
 const MIN_BUY_INTERVALS = 2;
 
-// Program IDs / sysvar addresses that are never buyer wallets
-const NON_WALLET_IDS: ReadonlySet<string> = new Set([
-  "11111111111111111111111111111111",
-  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-  "ComputeBudget111111111111111111111111111111",
-  "SysvarRent111111111111111111111111111111111",
-  "SysvarC1ock11111111111111111111111111111111",
-  "Sysvar1nstructions1111111111111111111111111",
-  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
-]);
+// Anchor event discriminant: sha256("event:TradeEvent")[0..8]
+// BUY events are resolved directly from this log data — no HTTP fetch needed.
+const TRADE_EVENT_DISC = createHash("sha256")
+  .update("event:TradeEvent")
+  .digest()
+  .subarray(0, 8);
+
+const BASE58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -47,10 +47,10 @@ interface TokenState {
   buyTimestamps: number[];
 }
 
+// Only CREATE events are queued for HTTP fetch
 interface QueuedSig {
   signature: string;
   slot: number;
-  eventType: "create" | "buy";
 }
 
 // ── In-memory state ───────────────────────────────────────────────────────────
@@ -65,8 +65,13 @@ let parser: PumpFunTransactionParser | null = null;
 let rawMessages = 0;
 let createEvents = 0;
 let buyEvents = 0;
+let buyLogHits = 0;   // BUY events resolved from Program data (no HTTP)
+let buyLogMisses = 0; // BUY events where log parsing failed (skipped)
 let fetchAttempts = 0;
 let fetchMisses = 0;
+
+// Exponential backoff state for Helius HTTP rate limiting
+let rateLimitBackoffMs = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -96,18 +101,53 @@ function detectEventType(logs: string[]): "create" | "buy" | "sell" | null {
   return null;
 }
 
-// Extract the first wallet address that is not a program/sysvar/mint
-function extractBuyerWallet(
-  parsed: ParsedPumpFunTransaction,
-  programId: string,
-): string | null {
-  const denylist = new Set<string>(NON_WALLET_IDS);
-  denylist.add(programId);
-  for (const m of parsed.candidateMints) {
-    if (m.length > 0) denylist.add(m);
+// Encode raw bytes to base58 (Solana pubkey format)
+function base58Encode(bytes: Uint8Array): string {
+  let num = 0n;
+  for (const byte of bytes) num = num * 256n + BigInt(byte);
+  let result = "";
+  const base = 58n;
+  while (num > 0n) {
+    result = BASE58_CHARS[Number(num % base)] + result;
+    num /= base;
   }
-  for (const w of parsed.candidateWallets) {
-    if (w.length > 0 && !denylist.has(w)) return w;
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    result = "1" + result;
+  }
+  return result;
+}
+
+// Parse pump.fun's Anchor TradeEvent from "Program data: <base64>" log lines.
+// TradeEvent layout (Borsh, after 8-byte discriminant):
+//   mint[32] solAmount[8] tokenAmount[8] isBuy[1] user[32] timestamp[8] ...
+// Total: 113 bytes. No HTTP fetch required.
+function extractTradeEventFromLogs(
+  logs: string[],
+): { mint: string; buyer: string; isBuy: boolean } | null {
+  for (const line of logs) {
+    if (!line.startsWith("Program data: ")) continue;
+    const b64 = line.slice("Program data: ".length).trim();
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(b64, "base64");
+    } catch {
+      continue;
+    }
+    if (buf.length < 113) continue;
+    let match = true;
+    for (let i = 0; i < 8; i++) {
+      if (buf[i] !== TRADE_EVENT_DISC[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (!match) continue;
+    return {
+      mint: base58Encode(buf.subarray(8, 40)),
+      isBuy: buf[56] === 1,
+      buyer: base58Encode(buf.subarray(57, 89)),
+    };
   }
   return null;
 }
@@ -117,6 +157,11 @@ function extractBuyerWallet(
 async function fetchTransaction(signature: string): Promise<unknown | null> {
   const url = config.solanaRpcHttpUrl;
   if (!url) return null;
+
+  if (rateLimitBackoffMs > 0) {
+    log("[BACKOFF]", { waitMs: rateLimitBackoffMs });
+    await sleep(rateLimitBackoffMs);
+  }
 
   fetchAttempts += 1;
   const body = JSON.stringify({
@@ -138,9 +183,23 @@ async function fetchTransaction(signature: string): Promise<unknown | null> {
       body,
       signal: controller.signal,
     });
-    if (!res.ok) { fetchMisses += 1; return null; }
+    if (res.status === 429) {
+      rateLimitBackoffMs =
+        rateLimitBackoffMs === 0 ? 2_000 : Math.min(rateLimitBackoffMs * 2, MAX_BACKOFF_MS);
+      log("[RATE-LIMITED]", { backoffMs: rateLimitBackoffMs });
+      fetchMisses += 1;
+      return null;
+    }
+    if (!res.ok) {
+      fetchMisses += 1;
+      return null;
+    }
     const json = (await res.json()) as { result?: unknown };
-    if (!json.result) { fetchMisses += 1; }
+    if (!json.result) {
+      fetchMisses += 1;
+    } else if (rateLimitBackoffMs > 0) {
+      rateLimitBackoffMs = Math.max(0, rateLimitBackoffMs - 1_000);
+    }
     return json.result ?? null;
   } catch {
     fetchMisses += 1;
@@ -167,15 +226,9 @@ function handleCreate(parsed: ParsedPumpFunTransaction): void {
   log("[CREATE]", { mint: mint.slice(0, 8) + "…", tracked: tokens.size });
 }
 
-function handleBuy(parsed: ParsedPumpFunTransaction, programId: string): void {
-  const mint = parsed.candidateMints[0];
-  if (!mint) return;
-
+function handleBuyDirect(mint: string, buyer: string): void {
   const state = tokens.get(mint);
-  if (!state) return; // not a token we're tracking
-
-  const buyer = extractBuyerWallet(parsed, programId);
-  if (!buyer) return;
+  if (!state) return;
 
   const now = Date.now();
   state.uniqueBuyers.add(buyer);
@@ -192,7 +245,7 @@ function handleBuy(parsed: ParsedPumpFunTransaction, programId: string): void {
   });
 }
 
-async function processQueuedSig(item: QueuedSig): Promise<void> {
+async function processQueuedCreate(item: QueuedSig): Promise<void> {
   if (!parser) return;
 
   const txData = await fetchTransaction(item.signature);
@@ -216,15 +269,7 @@ async function processQueuedSig(item: QueuedSig): Promise<void> {
     return;
   }
 
-  const programId = config.pumpfunProgramId;
-
-  if (item.eventType === "create") {
-    handleCreate(parsed);
-  } else {
-    // For buy events the parser may return BUY or UNKNOWN — try to extract
-    // the mint and buyer regardless of the classified kind.
-    handleBuy(parsed, programId);
-  }
+  handleCreate(parsed);
 }
 
 // ── Queue processor (runs every QUEUE_TICK_MS) ────────────────────────────────
@@ -234,7 +279,7 @@ async function processQueue(): Promise<void> {
 
   const batch = queue.splice(0, QUEUE_BATCH_SIZE);
   for (let i = 0; i < batch.length; i++) {
-    await processQueuedSig(batch[i]);
+    await processQueuedCreate(batch[i]);
     if (i < batch.length - 1) await sleep(TX_FETCH_DELAY_MS);
   }
 }
@@ -329,8 +374,11 @@ async function evaluate(): Promise<void> {
     rawWsMessages: rawMessages,
     createEvents,
     buyEvents,
+    buyLogHits,
+    buyLogMisses,
     fetchAttempts,
     fetchMisses,
+    rateLimitBackoffMs,
     queuePending: queue.length,
     sent,
   });
@@ -357,7 +405,6 @@ interface LogsNotification {
 function handleWsMessage(raw: string): void {
   rawMessages += 1;
 
-  // Log first 3 raw frames to confirm subscription and message shape
   if (rawMessages <= 3) {
     log("[RAW]", { n: rawMessages, frame: raw.slice(0, 300) });
   }
@@ -386,19 +433,26 @@ function handleWsMessage(raw: string): void {
   const eventType = detectEventType(logs);
   if (eventType === null || eventType === "sell") return;
 
-  // Skip if already in queue (duplicate notification)
-  if (queue.some((q) => q.signature === signature)) return;
-
-  // Cap queue to prevent unbounded growth during high-volume bursts
-  if (queue.length >= 1000) {
-    queue.shift();
+  if (eventType === "buy") {
+    // Resolve BUY events directly from the Anchor TradeEvent in Program data logs.
+    // This avoids all HTTP fetches for buys, which are ~99% of events.
+    const trade = extractTradeEventFromLogs(logs);
+    if (trade && trade.isBuy) {
+      buyLogHits += 1;
+      handleBuyDirect(trade.mint, trade.buyer);
+    } else {
+      buyLogMisses += 1;
+    }
+    return;
   }
 
-  queue.push({ signature, slot, eventType });
-  log(`[QUEUED-${eventType.toUpperCase()}]`, {
-    sig: signature.slice(0, 12) + "…",
-    qLen: queue.length,
-  });
+  // CREATE: queue for HTTP fetch (low volume, mint requires full transaction)
+  if (queue.some((q) => q.signature === signature)) return;
+  if (queue.length >= 500) {
+    queue.shift();
+  }
+  queue.push({ signature, slot });
+  log("[QUEUED-CREATE]", { sig: signature.slice(0, 12) + "…", qLen: queue.length });
 }
 
 // ── WebSocket connection ───────────────────────────────────────────────────────
@@ -472,8 +526,14 @@ function main(): void {
     evaluate().catch((err: Error) => log("[EVAL-ERR]", { error: err.message }));
   }, EVAL_INTERVAL_MS);
 
-  process.on("SIGINT", () => { log("shutting down"); process.exit(0); });
-  process.on("SIGTERM", () => { log("shutting down"); process.exit(0); });
+  process.on("SIGINT", () => {
+    log("shutting down");
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    log("shutting down");
+    process.exit(0);
+  });
 }
 
 main();
