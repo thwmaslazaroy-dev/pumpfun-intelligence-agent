@@ -157,7 +157,7 @@ export const config: AppConfig = {
   budgetHeliusHttpPerHour: readInt("BUDGET_HELIUS_HTTP_PER_HOUR", 1_000),
   budgetHeliusHttpPerDay: readInt("BUDGET_HELIUS_HTTP_PER_DAY", 8_000),
   budgetPumpfunFrontendPerMin: readInt("BUDGET_PUMPFUN_FRONTEND_PER_MIN", 15),
-  budgetPumpfunFrontendPerHour: readInt("BUDGET_PUMPFUN_FRONTEND_PER_HOUR", 150),
+  budgetPumpfunFrontendPerHour: readInt("BUDGET_PUMPFUN_FRONTEND_PER_HOUR", 60),
   budgetPumpfunFrontendPerDay: readInt("BUDGET_PUMPFUN_FRONTEND_PER_DAY", 1_000),
   budgetMoralisPerMin: readInt("BUDGET_MORALIS_PER_MIN", 5),
   budgetMoralisPerHour: readInt("BUDGET_MORALIS_PER_HOUR", 60),

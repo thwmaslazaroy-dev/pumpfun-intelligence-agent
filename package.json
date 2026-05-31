@@ -40,7 +40,9 @@
     "report:creator-candidates": "tsx src/scripts/report-creator-candidates.ts",
     "monitor:momentum": "tsx src/scripts/monitor-momentum.ts",
     "radar:live:momentum": "tsx src/scripts/radar-live-momentum.ts",
-    "api:usage": "tsx src/scripts/api-usage.ts"
+    "api:usage": "tsx src/scripts/api-usage.ts",
+    "report:enrichment": "tsx src/scripts/report-enrichment.ts",
+    "retry:enrichment": "tsx src/scripts/retry-enrichment.ts"
   },
   "keywords": [
     "pumpfun",

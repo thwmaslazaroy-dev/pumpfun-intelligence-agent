@@ -180,12 +180,14 @@ export class SqliteTokenRepository implements TokenRepository {
             ELSE social_links_json
           END,
           name = CASE
-            WHEN name IN ('', 'UNKNOWN') AND excluded.name NOT IN ('', 'UNKNOWN')
+            WHEN name IN ('', 'Unknown', 'UNKNOWN')
+             AND excluded.name NOT IN ('', 'Unknown', 'UNKNOWN')
             THEN excluded.name
             ELSE name
           END,
           symbol = CASE
-            WHEN symbol IN ('', 'UNKNOWN') AND excluded.symbol NOT IN ('', 'UNKNOWN')
+            WHEN symbol IN ('', 'Unknown', 'UNKNOWN')
+             AND excluded.symbol NOT IN ('', 'Unknown', 'UNKNOWN')
             THEN excluded.symbol
             ELSE symbol
           END`,
