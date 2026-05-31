@@ -24,6 +24,12 @@ export interface MoralisServiceConfig {
   baseUrl?: string;
   network?: string;
   timeoutMs?: number;
+  /** When set, enforces rate limits and caches price/swap results */
+  budgetManager?: import("./request-budget-manager").RequestBudgetManager;
+  /** Price result cache TTL in ms (default: 10 min) */
+  priceTtlMs?: number;
+  /** Swaps result cache TTL in ms (default: 30 min) */
+  swapsTtlMs?: number;
 }
 
 const DEFAULT_BASE_URL = "https://solana-gateway.moralis.io";
@@ -36,6 +42,9 @@ export class MoralisTokenEnrichmentService {
   private readonly baseUrl: string;
   private readonly network: string;
   private readonly timeoutMs: number;
+  private readonly budget?: import("./request-budget-manager").RequestBudgetManager;
+  private readonly priceTtlMs: number;
+  private readonly swapsTtlMs: number;
 
   constructor(cfg: MoralisServiceConfig) {
     if (!cfg.apiKey) {
@@ -45,6 +54,9 @@ export class MoralisTokenEnrichmentService {
     this.baseUrl = cfg.baseUrl ?? DEFAULT_BASE_URL;
     this.network = cfg.network ?? DEFAULT_NETWORK;
     this.timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.budget = cfg.budgetManager;
+    this.priceTtlMs = cfg.priceTtlMs ?? 10 * 60 * 1000;
+    this.swapsTtlMs = cfg.swapsTtlMs ?? 30 * 60 * 1000;
   }
 
   async getTokenPrice(mint: string): Promise<MoralisCallResult> {
@@ -57,6 +69,15 @@ export class MoralisTokenEnrichmentService {
 
   async getTokenEnrichmentSnapshot(mint: string): Promise<EnrichmentSnapshot> {
     const observedAt = new Date();
+
+    // Budget gate before making any Moralis calls
+    if (this.budget) {
+      const check = this.budget.allowRequest("moralis", "MEDIUM");
+      if (!check.allowed) {
+        return this.blockedSnapshot(mint, observedAt, `budget blocked: ${check.reason}`);
+      }
+    }
+
     const priceResult = await this.getTokenPrice(mint);
     const swapsResult = await this.getTokenSwaps(mint);
 
@@ -118,6 +139,13 @@ export class MoralisTokenEnrichmentService {
       if (!res.ok) {
         const m = (body as { message?: unknown } | null)?.message;
         errorMessage = typeof m === "string" ? m : `HTTP ${res.status}`;
+        if (res.status === 429) {
+          this.budget?.recordRateLimit("moralis", pathSegment);
+        } else {
+          this.budget?.recordRequest("moralis", pathSegment, { statusCode: res.status });
+        }
+      } else {
+        this.budget?.recordRequest("moralis", pathSegment, { statusCode: res.status });
       }
       return {
         endpointPath: pathSegment,
@@ -127,6 +155,7 @@ export class MoralisTokenEnrichmentService {
         body,
       };
     } catch (err) {
+      this.budget?.recordRequest("moralis", pathSegment, { statusCode: null, reason: "fetch-error" });
       return {
         endpointPath: pathSegment,
         status: null,
@@ -136,6 +165,19 @@ export class MoralisTokenEnrichmentService {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private blockedSnapshot(mint: string, observedAt: Date, reason: string): EnrichmentSnapshot {
+    return {
+      mint,
+      observedAt,
+      usdPrice: null,
+      swapCount: null,
+      firstSwapType: null,
+      firstSwapExchange: null,
+      priceCall: { ok: false, status: null, errorMessage: reason },
+      swapsCall: { ok: false, status: null, errorMessage: reason },
+    };
   }
 }
 

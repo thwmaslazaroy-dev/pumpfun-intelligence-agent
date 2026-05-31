@@ -163,6 +163,75 @@ CREATE TABLE IF NOT EXISTS momentum_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_momentum_mint_time ON momentum_snapshots(mint, captured_at DESC);
+
+CREATE TABLE IF NOT EXISTS api_request_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  service TEXT NOT NULL,
+  window_type TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  rate_limit_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(service, window_type, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_usage_service_window
+  ON api_request_usage(service, window_type, window_start DESC);
+
+CREATE TABLE IF NOT EXISTS api_request_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  service TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  method TEXT NOT NULL DEFAULT 'GET',
+  status_code INTEGER,
+  cache_hit INTEGER NOT NULL DEFAULT 0,
+  requested_at INTEGER NOT NULL,
+  reason TEXT,
+  related_mint TEXT,
+  related_signature TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_log_service_time ON api_request_log(service, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_log_time ON api_request_log(requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS processed_signatures (
+  signature TEXT PRIMARY KEY,
+  processed_at INTEGER NOT NULL,
+  result_kind TEXT
+);
+
+CREATE TABLE IF NOT EXISTS token_enrichment_cache (
+  mint TEXT PRIMARY KEY,
+  name TEXT,
+  symbol TEXT,
+  market_cap_usd REAL,
+  bonding_curve_progress REAL,
+  buy_count INTEGER,
+  sell_count INTEGER,
+  volume_usd REAL,
+  social_links_json TEXT,
+  fetched_at INTEGER NOT NULL,
+  ttl_ms INTEGER NOT NULL DEFAULT 21600000
+);
+
+CREATE TABLE IF NOT EXISTS enrichment_filter_stats (
+  day_start INTEGER NOT NULL PRIMARY KEY,
+  filtered_by_rule_a INTEGER NOT NULL DEFAULT 0,
+  filtered_by_rule_b INTEGER NOT NULL DEFAULT 0,
+  filtered_by_rule_c INTEGER NOT NULL DEFAULT 0,
+  sampled_unknown_creators INTEGER NOT NULL DEFAULT 0,
+  enrichments_performed INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS enrichment_metrics (
+  day_start INTEGER NOT NULL PRIMARY KEY,
+  successful_enrichments INTEGER NOT NULL DEFAULT 0,
+  mint_mismatches INTEGER NOT NULL DEFAULT 0,
+  enrichment_retries INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 let db: Database.Database | null = null;

@@ -1,5 +1,6 @@
 import { logger } from "../utils/logger";
 import { AlertDecision } from "./alert-policy";
+import { RequestBudgetManager } from "../services/request-budget-manager";
 
 interface DiscordEmbedField {
   name: string;
@@ -31,14 +32,32 @@ export interface DiscordAlertResult {
 }
 
 export class DiscordAlertService {
+  private readonly budget?: RequestBudgetManager;
+
   constructor(
     private readonly webhookUrl: string,
     private readonly fetchImpl: typeof fetch | undefined = typeof fetch !== "undefined"
       ? fetch
       : undefined,
-  ) {}
+    opts: { budgetManager?: RequestBudgetManager } = {},
+  ) {
+    this.budget = opts.budgetManager;
+  }
 
   async send(decision: AlertDecision): Promise<DiscordAlertResult> {
+    // Budget gate — alerts are HIGH priority (important but not CRITICAL)
+    if (this.budget) {
+      const check = this.budget.allowRequest("discord", "HIGH");
+      if (!check.allowed) {
+        logger.warn("budget: discord blocked alert", {
+          reason: check.reason,
+          mint: decision.context.token.mint,
+          alertType: decision.alertType,
+        });
+        return { delivered: false, preview: false };
+      }
+    }
+
     const body = renderDiscordPayload(decision);
 
     if (!this.webhookUrl) {
@@ -76,8 +95,14 @@ export class DiscordAlertService {
           body: text.slice(0, 500),
           mint: decision.context.token.mint,
         });
+        if (res.status === 429) {
+          this.budget?.recordRateLimit("discord", "webhook");
+        } else {
+          this.budget?.recordRequest("discord", "webhook", { statusCode: res.status, relatedMint: decision.context.token.mint });
+        }
         return { delivered: false, preview: false, status: res.status };
       }
+      this.budget?.recordRequest("discord", "webhook", { statusCode: res.status, relatedMint: decision.context.token.mint });
       return { delivered: true, preview: false, status: res.status };
     } catch (err) {
       logger.error("alert: discord webhook POST failed", {

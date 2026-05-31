@@ -12,7 +12,12 @@ import { LivePumpFunDiscovery } from "./providers/live-pumpfun-discovery";
 import { LivePumpFunProvider } from "./providers/live-pumpfun-provider";
 import { PumpFunTransactionParser } from "./parsing/pumpfun-transaction-parser";
 import { TokenIngestionJob } from "./jobs/token-ingestion-job";
-import { TokenRiskFlagService } from "./services";
+import {
+  TokenRiskFlagService,
+  initRequestBudgetManager,
+  PumpFunCoinEnrichmentService,
+  EnrichmentFilter,
+} from "./services";
 import {
   CombinedScoringService,
   CreatorScoringService,
@@ -70,6 +75,24 @@ async function main(): Promise<void> {
 
   initDatabase(config.databaseUrl);
 
+  const budget = initRequestBudgetManager({
+    limits: {
+      helius_http: { perMinute: config.budgetHeliusHttpPerMin, perHour: config.budgetHeliusHttpPerHour, perDay: config.budgetHeliusHttpPerDay },
+      helius_ws: { perMinute: 120, perHour: 5_000, perDay: 50_000 },
+      pumpfun_frontend: { perMinute: config.budgetPumpfunFrontendPerMin, perHour: config.budgetPumpfunFrontendPerHour, perDay: config.budgetPumpfunFrontendPerDay },
+      moralis: { perMinute: config.budgetMoralisPerMin, perHour: config.budgetMoralisPerHour, perDay: config.budgetMoralisPerDay },
+      discord: { perMinute: config.budgetDiscordPerMin, perHour: config.budgetDiscordPerHour, perDay: config.budgetDiscordPerDay },
+    },
+    warnPct: config.budgetWarnPct,
+    pausePct: config.budgetPausePct,
+    emergencyPct: config.budgetEmergencyPct,
+  });
+  logger.info("request budget manager ready", {
+    helius_http_day: config.budgetHeliusHttpPerDay,
+    moralis_day: config.budgetMoralisPerDay,
+    pumpfun_frontend_day: config.budgetPumpfunFrontendPerDay,
+  });
+
   const repo = new SqliteTokenRepository();
   const creatorRepo = new SqliteCreatorRepository();
 
@@ -79,6 +102,25 @@ async function main(): Promise<void> {
   const scoringService = new RiskScoringService();
   const creatorScoringService = new CreatorScoringService();
   const combinedScoringService = new CombinedScoringService();
+
+  // Enrichment service — only instantiated when the feature flag is on
+  let enrichmentService: PumpFunCoinEnrichmentService | undefined;
+  let enrichmentFilter: EnrichmentFilter | undefined;
+
+  if (config.enableTokenEnrichment) {
+    enrichmentService = new PumpFunCoinEnrichmentService({
+      budgetManager: budget,
+      cacheTtlMs: config.cacheEnrichmentTtlMs,
+    });
+    enrichmentFilter = new EnrichmentFilter(config.enrichUnknownCreatorPercent);
+    logger.info("token enrichment enabled", {
+      cacheTtlMs: config.cacheEnrichmentTtlMs,
+      budgetPerDay: config.budgetPumpfunFrontendPerDay,
+      unknownCreatorSamplePct: config.enrichUnknownCreatorPercent,
+    });
+  } else {
+    logger.info("token enrichment disabled (set ENABLE_TOKEN_ENRICHMENT=true to enable)");
+  }
 
   let provider: PumpFunProvider;
   let liveProvider: LivePumpFunProvider | null = null;
@@ -98,6 +140,7 @@ async function main(): Promise<void> {
       httpUrl: config.solanaRpcHttpUrl,
       programId: config.pumpfunProgramId,
       parser,
+      budgetManager: budget,
     });
     liveProvider = new LivePumpFunProvider(discovery);
     await liveProvider.start();
@@ -110,7 +153,7 @@ async function main(): Promise<void> {
       alertCombinedRiskLevels: config.alertCombinedRiskLevels,
       alertExtremeRiskEnabled: config.alertExtremeRiskEnabled,
     });
-    alertService = new DiscordAlertService(config.discordWebhookUrl);
+    alertService = new DiscordAlertService(config.discordWebhookUrl, undefined, { budgetManager: budget });
     logger.info("alert config", {
       webhookConfigured: Boolean(config.discordWebhookUrl),
       minCombinedAlertScore: config.minCombinedAlertScore,
@@ -129,6 +172,8 @@ async function main(): Promise<void> {
     combinedScoringService,
     alertPolicy,
     alertService,
+    enrichmentService,
+    enrichmentFilter,
   );
 
   if (opts.watch) {

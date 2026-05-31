@@ -38,6 +38,29 @@ export interface AppConfig {
   momentumBcVelocityPerMin: number;
   momentumMinBuyPressure: number;
   momentumMinNewBuys: number;
+  // Request budget limits
+  budgetHeliusHttpPerMin: number;
+  budgetHeliusHttpPerHour: number;
+  budgetHeliusHttpPerDay: number;
+  budgetPumpfunFrontendPerMin: number;
+  budgetPumpfunFrontendPerHour: number;
+  budgetPumpfunFrontendPerDay: number;
+  budgetMoralisPerMin: number;
+  budgetMoralisPerHour: number;
+  budgetMoralisPerDay: number;
+  budgetDiscordPerMin: number;
+  budgetDiscordPerHour: number;
+  budgetDiscordPerDay: number;
+  budgetWarnPct: number;
+  budgetPausePct: number;
+  budgetEmergencyPct: number;
+  // Cache TTLs
+  cacheEnrichmentTtlMs: number;
+  cacheMoralisPriceTtlMs: number;
+  cacheMoralisSwapsTtlMs: number;
+  // Feature flags
+  enableTokenEnrichment: boolean;
+  enrichUnknownCreatorPercent: number;
 }
 
 function read(name: string, fallback = ""): string {
@@ -129,4 +152,26 @@ export const config: AppConfig = {
     return Number.isFinite(n) ? n : 0.65;
   })(),
   momentumMinNewBuys: readInt("MOMENTUM_MIN_NEW_BUYS", 3),
+  // Request budget limits (conservative defaults; raise in .env if needed)
+  budgetHeliusHttpPerMin: readInt("BUDGET_HELIUS_HTTP_PER_MIN", 60),
+  budgetHeliusHttpPerHour: readInt("BUDGET_HELIUS_HTTP_PER_HOUR", 1_000),
+  budgetHeliusHttpPerDay: readInt("BUDGET_HELIUS_HTTP_PER_DAY", 8_000),
+  budgetPumpfunFrontendPerMin: readInt("BUDGET_PUMPFUN_FRONTEND_PER_MIN", 15),
+  budgetPumpfunFrontendPerHour: readInt("BUDGET_PUMPFUN_FRONTEND_PER_HOUR", 150),
+  budgetPumpfunFrontendPerDay: readInt("BUDGET_PUMPFUN_FRONTEND_PER_DAY", 1_000),
+  budgetMoralisPerMin: readInt("BUDGET_MORALIS_PER_MIN", 5),
+  budgetMoralisPerHour: readInt("BUDGET_MORALIS_PER_HOUR", 60),
+  budgetMoralisPerDay: readInt("BUDGET_MORALIS_PER_DAY", 200),
+  budgetDiscordPerMin: readInt("BUDGET_DISCORD_PER_MIN", 5),
+  budgetDiscordPerHour: readInt("BUDGET_DISCORD_PER_HOUR", 50),
+  budgetDiscordPerDay: readInt("BUDGET_DISCORD_PER_DAY", 100),
+  budgetWarnPct: readInt("BUDGET_WARN_PCT", 70),
+  budgetPausePct: readInt("BUDGET_PAUSE_PCT", 85),
+  budgetEmergencyPct: readInt("BUDGET_EMERGENCY_PCT", 95),
+  // Cache TTLs in milliseconds
+  cacheEnrichmentTtlMs: readInt("CACHE_ENRICHMENT_TTL_MS", 6 * 60 * 60 * 1000),   // 6h
+  cacheMoralisPriceTtlMs: readInt("CACHE_MORALIS_PRICE_TTL_MS", 10 * 60 * 1000),  // 10 min
+  cacheMoralisSwapsTtlMs: readInt("CACHE_MORALIS_SWAPS_TTL_MS", 30 * 60 * 1000),  // 30 min
+  enableTokenEnrichment: readBool("ENABLE_TOKEN_ENRICHMENT", false),
+  enrichUnknownCreatorPercent: readInt("ENRICH_UNKNOWN_CREATOR_PERCENT", 10),
 };

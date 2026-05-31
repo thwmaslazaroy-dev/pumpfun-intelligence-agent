@@ -39,7 +39,8 @@
     "evaluate:holder-risk": "tsx src/scripts/evaluate-holder-risk.ts",
     "report:creator-candidates": "tsx src/scripts/report-creator-candidates.ts",
     "monitor:momentum": "tsx src/scripts/monitor-momentum.ts",
-    "radar:live:momentum": "tsx src/scripts/radar-live-momentum.ts"
+    "radar:live:momentum": "tsx src/scripts/radar-live-momentum.ts",
+    "api:usage": "tsx src/scripts/api-usage.ts"
   },
   "keywords": [
     "pumpfun",

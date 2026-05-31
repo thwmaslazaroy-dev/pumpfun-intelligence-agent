@@ -5,6 +5,7 @@ import {
   RawTransactionLine,
 } from "../parsing/pumpfun-transaction-parser";
 import { ParsedPumpFunTransaction } from "../types";
+import { RequestBudgetManager } from "../services/request-budget-manager";
 
 export type SolanaCommitment = "processed" | "confirmed" | "finalized";
 
@@ -18,6 +19,8 @@ export interface LivePumpFunDiscoveryConfig {
   heartbeatIntervalMs?: number;
   initialReconnectDelayMs?: number;
   maxReconnectDelayMs?: number;
+  /** Optional budget manager. When present, enforces per-min/hour/day limits and deduplicates signatures across restarts. */
+  budgetManager?: RequestBudgetManager;
 }
 
 export interface OnCreateEvent {
@@ -100,7 +103,9 @@ const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const STOP_CLEANUP_FALLBACK_MS = 2_000;
 
 export class LivePumpFunDiscovery {
-  private readonly cfg: Required<LivePumpFunDiscoveryConfig>;
+  private readonly cfg: Required<Omit<LivePumpFunDiscoveryConfig, "budgetManager">> & {
+    budgetManager?: RequestBudgetManager;
+  };
   private ws: WebSocket | null = null;
   private subscriptionId: number | null = null;
   private wsRequestId = 1;
@@ -161,6 +166,7 @@ export class LivePumpFunDiscovery {
       initialReconnectDelayMs:
         cfg.initialReconnectDelayMs ?? DEFAULT_INITIAL_RECONNECT_DELAY_MS,
       maxReconnectDelayMs: cfg.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS,
+      budgetManager: cfg.budgetManager,
     };
   }
 
@@ -450,6 +456,27 @@ export class LivePumpFunDiscovery {
     signature: string,
     slot: number | null,
   ): Promise<void> {
+    const budget = this.cfg.budgetManager;
+
+    // Cross-session signature dedup — skip if already processed in a prior run
+    if (budget?.hasProcessedSignature(signature)) {
+      this.counters.duplicateSignatures += 1;
+      return;
+    }
+
+    // Budget gate — CRITICAL priority since this is live detection
+    if (budget) {
+      const check = budget.allowRequest("helius_http", "CRITICAL");
+      if (!check.allowed) {
+        logger.warn("budget: helius_http blocked getTransaction", {
+          reason: check.reason,
+          dayUsagePct: check.dayUsagePct.toFixed(1),
+          signature,
+        });
+        return;
+      }
+    }
+
     let txResult: unknown = null;
     try {
       const res = await this.rpcGetTransaction(signature);
@@ -462,9 +489,11 @@ export class LivePumpFunDiscovery {
         if (isRateLimitText(msg) || res.error.code === 429 || res.error.code === -32005) {
           this.counters.rpcRateLimitErrors += 1;
           this.maybeLogErrorSample("rpcRateLimit", msg, { signature });
+          budget?.recordRateLimit("helius_http", "getTransaction");
         } else {
           this.counters.rpcFetchErrors += 1;
           this.maybeLogErrorSample("rpcFetch", msg, { signature });
+          budget?.recordRequest("helius_http", "getTransaction", { statusCode: res.error.code ?? 500, relatedSignature: signature });
         }
         return;
       }
@@ -473,21 +502,26 @@ export class LivePumpFunDiscovery {
         this.counters.rpcNullTransaction += 1;
         // Null is common (tx not yet finalized). Sample only when throttle window allows.
         this.maybeLogErrorSample("rpcNull", "getTransaction returned null", { signature });
+        budget?.recordRequest("helius_http", "getTransaction", { statusCode: null, reason: "result-null", relatedSignature: signature });
         return;
       }
       this.counters.fetchedTransactions += 1;
+      budget?.recordRequest("helius_http", "getTransaction", { statusCode: 200, relatedSignature: signature });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isDailyLimitText(msg)) {
         this.triggerDailyLimitShutdown(msg);
+        budget?.recordRateLimit("helius_http", "getTransaction");
         return;
       }
       if (isRateLimitText(msg)) {
         this.counters.rpcRateLimitErrors += 1;
         this.maybeLogErrorSample("rpcRateLimit", msg, { signature });
+        budget?.recordRateLimit("helius_http", "getTransaction");
       } else {
         this.counters.rpcFetchErrors += 1;
         this.maybeLogErrorSample("rpcFetch", msg, { signature });
+        budget?.recordRequest("helius_http", "getTransaction", { statusCode: 500, reason: msg.slice(0, 100), relatedSignature: signature });
       }
       return;
     }
@@ -519,6 +553,9 @@ export class LivePumpFunDiscovery {
       return;
     }
     this.counters.parsedTransactions += 1;
+
+    // Persist the signature so we skip it on restart
+    budget?.markSignatureProcessed(signature, parsed.kind);
 
     if (parsed.kind === "UNKNOWN") {
       this.counters.unknownTransactions += 1;

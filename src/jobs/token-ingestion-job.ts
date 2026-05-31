@@ -14,6 +14,8 @@ import {
   RiskScoringService,
 } from "../scoring";
 import { AlertPolicy, DiscordAlertService } from "../alerts";
+import { PumpFunCoinEnrichmentService } from "../services/pumpfun-coin-enrichment-service";
+import { EnrichmentFilter, FilterCounterDelta, EnrichmentMetricsDelta } from "../services/enrichment-filter";
 
 export interface IngestionResult {
   fetched: number;
@@ -21,6 +23,17 @@ export interface IngestionResult {
   skippedDuplicates: number;
   invalid: number;
   scored: number;
+  // Enrichment
+  enriched: number;
+  enrichmentFailed: number;
+  enrichmentCacheHits: number;
+  enrichmentMintMismatch: number;
+  // Pre-enrichment filter
+  filteredByRuleA: number;
+  filteredByRuleB: number;
+  filteredByRuleC: number;
+  sampledUnknownCreators: number;
+  // Downstream
   creatorsEvaluated: number;
   combinedEvaluations: number;
   alertsSent: number;
@@ -39,6 +52,13 @@ export class TokenIngestionJob {
     private readonly combinedScoringService: CombinedScoringService = new CombinedScoringService(),
     private readonly alertPolicy?: AlertPolicy,
     private readonly alertService?: DiscordAlertService,
+    /** Optional. When provided, enriches each newly detected token before scoring. */
+    private readonly enrichmentService?: PumpFunCoinEnrichmentService,
+    /**
+     * Optional. When provided alongside enrichmentService, gates enrichment calls
+     * using creator history from SQLite before making any API requests.
+     */
+    private readonly enrichmentFilter?: EnrichmentFilter,
   ) {}
 
   async runOnce(): Promise<IngestionResult> {
@@ -48,6 +68,14 @@ export class TokenIngestionJob {
       skippedDuplicates: 0,
       invalid: 0,
       scored: 0,
+      enriched: 0,
+      enrichmentFailed: 0,
+      enrichmentCacheHits: 0,
+      enrichmentMintMismatch: 0,
+      filteredByRuleA: 0,
+      filteredByRuleB: 0,
+      filteredByRuleC: 0,
+      sampledUnknownCreators: 0,
       creatorsEvaluated: 0,
       combinedEvaluations: 0,
       alertsSent: 0,
@@ -98,6 +126,7 @@ export class TokenIngestionJob {
         continue;
       }
 
+      // ── Save minimal token (name="Unknown", marketCap=0) ─────────────────
       await this.repo.saveTokenLaunch(token);
       result.saved += 1;
       logger.info("ingestion: saved token", {
@@ -107,24 +136,100 @@ export class TokenIngestionJob {
         marketCapUsd: token.initialMarketCapUsd,
       });
 
-      const flags = this.flagService.evaluate(token);
-      await this.repo.saveRiskFlags(token.mint, flags);
+      // ── Pre-enrichment filter ─────────────────────────────────────────────
+      // Consults SQLite creator history to skip enrichment API calls for tokens
+      // that cannot produce meaningful alerts regardless of their market data.
+      let tokenForScoring = token;
+      let enrichmentAttempted = false;
 
-      const tokenScore = this.scoringService.score(token, flags);
+      if (this.enrichmentService) {
+        let shouldEnrich = true;
+
+        if (this.enrichmentFilter) {
+          const filterResult = this.enrichmentFilter.evaluate(
+            token.creatorWallet,
+            Date.now(),
+          );
+          shouldEnrich = filterResult.shouldEnrich;
+
+          switch (filterResult.rule) {
+            case "A_skip":
+              result.filteredByRuleA += 1;
+              break;
+            case "A_sample":
+              result.sampledUnknownCreators += 1;
+              break;
+            case "B":
+              result.filteredByRuleB += 1;
+              break;
+            case "C":
+              result.filteredByRuleC += 1;
+              break;
+            // "pass" — no counter, just proceeds
+          }
+
+          if (!shouldEnrich) {
+            logger.debug("ingestion: enrichment skipped by filter", {
+              mint: token.mint,
+              rule: filterResult.rule,
+              reason: filterResult.reason,
+            });
+          }
+        }
+
+        // ── Enrichment ──────────────────────────────────────────────────────
+        if (shouldEnrich) {
+          enrichmentAttempted = true;
+          const { token: enriched, outcome } = await this.enrichmentService.enrichMint(token);
+
+          if (outcome.cacheHit) {
+            result.enrichmentCacheHits += 1;
+          }
+
+          if (outcome.mintMismatch) {
+            result.enrichmentMintMismatch += 1;
+          }
+
+          if (outcome.enriched) {
+            result.enriched += 1;
+            // Update the stored row: overwrites name/symbol/marketCap/socials/counts
+            this.repo.upsertTokenFeedData(enriched);
+            tokenForScoring = enriched;
+          } else {
+            result.enrichmentFailed += 1;
+            logger.warn("ingestion: enrichment failed — scoring on minimal data", {
+              mint:         token.mint,
+              reason:       outcome.failureReason,
+              mintMismatch: outcome.mintMismatch,
+              retried:      outcome.retried,
+            });
+          }
+        }
+      }
+
+      // ── Risk flags ────────────────────────────────────────────────────────
+      const flags = this.flagService.evaluate(tokenForScoring);
+      await this.repo.saveRiskFlags(tokenForScoring.mint, flags);
+
+      // ── Token score ───────────────────────────────────────────────────────
+      const tokenScore = this.scoringService.score(tokenForScoring, flags);
       await this.repo.saveTokenScore(tokenScore);
       result.scored += 1;
 
       logger.info("token scored", {
-        mint: token.mint,
-        symbol: token.symbol,
+        mint: tokenForScoring.mint,
+        symbol: tokenForScoring.symbol,
         score: tokenScore.totalScore,
         riskLevel: tokenScore.riskLevel,
+        enriched: tokenForScoring !== token,
+        enrichmentAttempted,
       });
 
-      const profile = await this.upsertProfileForLaunch(token);
-      const history = await this.creatorRepo.listLaunchHistoryByCreator(token.creatorWallet);
+      // ── Creator profile + score ───────────────────────────────────────────
+      const profile = await this.upsertProfileForLaunch(tokenForScoring);
+      const history = await this.creatorRepo.listLaunchHistoryByCreator(tokenForScoring.creatorWallet);
       const stats = this.creatorScoringService.calculatePerformanceStats(
-        token.creatorWallet,
+        tokenForScoring.creatorWallet,
         history,
       );
       const creatorScore = this.creatorScoringService.score(profile, history);
@@ -141,46 +246,48 @@ export class TokenIngestionJob {
         rugLikeCount: stats.rugLikeCount,
       });
 
-      const combined = this.combinedScoringService.combine(token, tokenScore, creatorScore);
+      // ── Combined score ────────────────────────────────────────────────────
+      const combined = this.combinedScoringService.combine(tokenForScoring, tokenScore, creatorScore);
       await this.creatorRepo.saveCombinedEvaluation(combined);
       result.combinedEvaluations += 1;
 
       logger.info("combined evaluation", {
-        symbol: token.symbol,
+        symbol: tokenForScoring.symbol,
         tokenScore: combined.tokenScore,
         creatorScore: combined.creatorScore,
         combinedScore: combined.combinedScore,
         riskLevel: combined.combinedRiskLevel,
       });
 
+      // ── Alert ─────────────────────────────────────────────────────────────
       if (this.alertPolicy && this.alertService) {
         const decision = this.alertPolicy.evaluate({
-          token,
+          token: tokenForScoring,
           tokenScore,
           creatorScore,
           combined,
         });
         if (decision) {
           const alreadySent = await this.repo.hasAlertBeenSent(
-            token.mint,
+            tokenForScoring.mint,
             decision.alertType,
           );
           if (alreadySent) {
             result.alertsDeduped += 1;
             logger.debug("alert: dedup skip", {
-              mint: token.mint,
-              symbol: token.symbol,
+              mint: tokenForScoring.mint,
+              symbol: tokenForScoring.symbol,
               alertType: decision.alertType,
             });
           } else {
-            const outcome = await this.alertService.send(decision);
-            if (outcome.delivered || outcome.preview) {
-              await this.repo.recordAlertSent(token.mint, decision.alertType, new Date());
-              if (outcome.delivered) {
+            const alertOutcome = await this.alertService.send(decision);
+            if (alertOutcome.delivered || alertOutcome.preview) {
+              await this.repo.recordAlertSent(tokenForScoring.mint, decision.alertType, new Date());
+              if (alertOutcome.delivered) {
                 result.alertsSent += 1;
                 logger.info("alert sent", {
-                  mint: token.mint,
-                  symbol: token.symbol,
+                  mint: tokenForScoring.mint,
+                  symbol: tokenForScoring.symbol,
                   alertType: decision.alertType,
                   combinedScore: combined.combinedScore,
                   riskLevel: combined.combinedRiskLevel,
@@ -188,8 +295,8 @@ export class TokenIngestionJob {
               } else {
                 result.alertsPreviewed += 1;
                 logger.info("alert previewed (no webhook configured)", {
-                  mint: token.mint,
-                  symbol: token.symbol,
+                  mint: tokenForScoring.mint,
+                  symbol: tokenForScoring.symbol,
                   alertType: decision.alertType,
                   combinedScore: combined.combinedScore,
                   riskLevel: combined.combinedRiskLevel,
@@ -202,6 +309,30 @@ export class TokenIngestionJob {
     }
 
     logger.info("ingestion: run complete", result);
+
+    // ── Persist filter counters and enrichment metrics to SQLite ─────────────
+    if (this.enrichmentFilter && result.saved > 0) {
+      const enrichmentsPerformed =
+        result.enriched + result.enrichmentFailed + result.enrichmentCacheHits;
+
+      const filterDelta: FilterCounterDelta = {
+        filteredByRuleA:        result.filteredByRuleA,
+        filteredByRuleB:        result.filteredByRuleB,
+        filteredByRuleC:        result.filteredByRuleC,
+        sampledUnknownCreators: result.sampledUnknownCreators,
+        enrichmentsPerformed,
+      };
+      this.enrichmentFilter.persistCounterDelta(filterDelta);
+
+      const metricsDelta: EnrichmentMetricsDelta = {
+        successfulEnrichments: result.enriched,
+        mintMismatches:        result.enrichmentMintMismatch,
+        // Every mismatch triggers exactly one 30s retry.
+        enrichmentRetries:     result.enrichmentMintMismatch,
+      };
+      this.enrichmentFilter.persistEnrichmentMetrics(metricsDelta);
+    }
+
     return result;
   }
 

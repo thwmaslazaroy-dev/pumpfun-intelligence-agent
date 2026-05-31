@@ -129,6 +129,13 @@ export interface TokenRepository {
   listRecentTokens(limit: number): Promise<TokenLaunch[]>;
   recordAlertSent(mint: string, alertType: AlertType, sentAt: Date): Promise<void>;
   hasAlertBeenSent(mint: string, alertType: AlertType): Promise<boolean>;
+  /**
+   * Insert a new token row or update mutable feed fields on an existing one.
+   * name/symbol are only overwritten when the stored value is empty or "UNKNOWN".
+   * Identity fields (creator_wallet, launched_at) are never overwritten.
+   * Returns true if a new row was inserted, false if an existing row was updated.
+   */
+  upsertTokenFeedData(token: TokenLaunch): boolean;
 }
 
 export interface CreatorProfile {

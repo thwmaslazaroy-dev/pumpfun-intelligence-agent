@@ -13,3 +13,22 @@ export type {
   EnrichmentSnapshot,
   MoralisServiceConfig,
 } from "./moralis-token-enrichment-service";
+export {
+  RequestBudgetManager,
+  initRequestBudgetManager,
+  getRequestBudgetManager,
+} from "./request-budget-manager";
+export { PumpFunCoinEnrichmentService } from "./pumpfun-coin-enrichment-service";
+export type { EnrichmentServiceConfig, EnrichmentOutcome } from "./pumpfun-coin-enrichment-service";
+export { EnrichmentFilter } from "./enrichment-filter";
+export type { FilterResult, FilterRule, FilterCounterDelta, EnrichmentMetricsDelta } from "./enrichment-filter";
+export type {
+  ServiceName,
+  Priority,
+  ServiceLimits,
+  BudgetManagerConfig,
+  BudgetCheck,
+  RemainingBudget,
+  RecordOpts,
+  EnrichmentCacheEntry,
+} from "./request-budget-manager";
