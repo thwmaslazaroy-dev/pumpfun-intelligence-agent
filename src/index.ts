@@ -206,6 +206,10 @@ async function main(): Promise<void> {
     alertService,
     enrichmentService,
     enrichmentFilter,
+    {
+      enabled: config.enableDuplicateNameFilter,
+      lookbackHours: config.duplicateNameLookbackHours,
+    },
   );
 
   if (opts.watch) {

@@ -226,6 +226,7 @@ function main(): void {
     filtered_by_rule_a: number;
     filtered_by_rule_b: number;
     filtered_by_rule_c: number;
+    filtered_by_rule_d: number;
     sampled_unknown_creators: number;
     enrichments_performed: number;
     updated_at: number;
@@ -336,16 +337,19 @@ function main(): void {
   } else if (!filterStats) {
     w("  no data yet for today.\n");
   } else {
+    const ruleD = filterStats.filtered_by_rule_d ?? 0;
     const totalSaved =
       filterStats.filtered_by_rule_a +
       filterStats.filtered_by_rule_b +
       filterStats.filtered_by_rule_c +
+      ruleD +
       filterStats.sampled_unknown_creators +
       filterStats.enrichments_performed;
     const totalSkipped =
       filterStats.filtered_by_rule_a +
       filterStats.filtered_by_rule_b +
-      filterStats.filtered_by_rule_c;
+      filterStats.filtered_by_rule_c +
+      ruleD;
     const skipPct = totalSaved > 0 ? ((totalSkipped / totalSaved) * 100).toFixed(1) : "0.0";
     const lastUpdated = fmtTs(filterStats.updated_at);
 
@@ -353,6 +357,7 @@ function main(): void {
     w(`  ${pad("Rule A sampled (unknown, allowed):", 38)} ${filterStats.sampled_unknown_creators}\n`);
     w(`  ${pad("Rule B skipped (score < 50):", 38)} ${filterStats.filtered_by_rule_b}\n`);
     w(`  ${pad("Rule C skipped (high-frequency):", 38)} ${filterStats.filtered_by_rule_c}\n`);
+    w(`  ${pad("Rule D skipped (duplicate name):", 38)} ${ruleD}\n`);
     w(`  ${pad("Enrichments performed:", 38)} ${filterStats.enrichments_performed}\n`);
     w(`  ${"─".repeat(50)}\n`);
     w(`  ${pad("Total tokens evaluated:", 38)} ${totalSaved}\n`);

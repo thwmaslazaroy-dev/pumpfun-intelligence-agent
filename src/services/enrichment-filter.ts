@@ -39,7 +39,7 @@ const HIGH_FREQ_WINDOW_MS = 10_800_000; // 3 hours
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-export type FilterRule = "A_skip" | "A_sample" | "B" | "C" | "pass";
+export type FilterRule = "A_skip" | "A_sample" | "B" | "C" | "D" | "pass";
 
 export interface FilterResult {
   shouldEnrich: boolean;
@@ -55,6 +55,7 @@ export interface FilterCounterDelta {
   filteredByRuleA: number;
   filteredByRuleB: number;
   filteredByRuleC: number;
+  filteredByRuleD: number;
   sampledUnknownCreators: number;
   enrichmentsPerformed: number;
 }
@@ -191,6 +192,7 @@ export class EnrichmentFilter {
       delta.filteredByRuleA === 0 &&
       delta.filteredByRuleB === 0 &&
       delta.filteredByRuleC === 0 &&
+      delta.filteredByRuleD === 0 &&
       delta.sampledUnknownCreators === 0 &&
       delta.enrichmentsPerformed === 0
     ) {
@@ -204,12 +206,13 @@ export class EnrichmentFilter {
       .prepare(
         `INSERT INTO enrichment_filter_stats
            (day_start, filtered_by_rule_a, filtered_by_rule_b, filtered_by_rule_c,
-            sampled_unknown_creators, enrichments_performed, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+            filtered_by_rule_d, sampled_unknown_creators, enrichments_performed, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(day_start) DO UPDATE SET
            filtered_by_rule_a       = filtered_by_rule_a       + excluded.filtered_by_rule_a,
            filtered_by_rule_b       = filtered_by_rule_b       + excluded.filtered_by_rule_b,
            filtered_by_rule_c       = filtered_by_rule_c       + excluded.filtered_by_rule_c,
+           filtered_by_rule_d       = filtered_by_rule_d       + excluded.filtered_by_rule_d,
            sampled_unknown_creators = sampled_unknown_creators + excluded.sampled_unknown_creators,
            enrichments_performed    = enrichments_performed    + excluded.enrichments_performed,
            updated_at               = excluded.updated_at`,
@@ -219,6 +222,7 @@ export class EnrichmentFilter {
         delta.filteredByRuleA,
         delta.filteredByRuleB,
         delta.filteredByRuleC,
+        delta.filteredByRuleD,
         delta.sampledUnknownCreators,
         delta.enrichmentsPerformed,
         now,
@@ -265,4 +269,28 @@ export class EnrichmentFilter {
 
 function shortWallet(wallet: string): string {
   return wallet.length > 12 ? `${wallet.slice(0, 6)}…${wallet.slice(-4)}` : wallet;
+}
+
+// ── normalizeTokenName ────────────────────────────────────────────────────────
+
+const ZERO_WIDTH_RE =
+  /[​-‍﻿­͏ᅟᅠ឴឵ㅤﾠ]/g;
+
+const UNKNOWN_SENTINELS = new Set(["unknown", ""]);
+
+/**
+ * Normalize a token name for duplicate detection.
+ *  - Removes zero-width / invisible characters
+ *  - Trims leading/trailing whitespace
+ *  - Lowercases
+ *  - Collapses internal repeated whitespace to a single space
+ *
+ * Returns null when the name is empty, whitespace-only, or a known
+ * "Unknown" / "UNKNOWN" sentinel so callers can skip the duplicate check.
+ */
+export function normalizeTokenName(name: string): string | null {
+  if (!name) return null;
+  let n = name.replace(ZERO_WIDTH_RE, "").trim().toLowerCase().replace(/\s+/g, " ");
+  if (!n || UNKNOWN_SENTINELS.has(n)) return null;
+  return n;
 }

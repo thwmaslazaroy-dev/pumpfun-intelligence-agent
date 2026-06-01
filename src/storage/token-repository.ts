@@ -341,4 +341,23 @@ export class SqliteTokenRepository implements TokenRepository {
       .get(mint, alertType) as { x: number } | undefined;
     return Boolean(row);
   }
+
+  findDuplicateTokenName(
+    normalizedName: string,
+    currentMint: string,
+    lookbackMs: number,
+  ): { mint: string; name: string } | null {
+    const since = Date.now() - lookbackMs;
+    const row = this.db
+      .prepare(
+        `SELECT mint, name FROM tokens
+         WHERE lower(trim(name)) = ?
+           AND mint != ?
+           AND inserted_at >= ?
+         ORDER BY inserted_at ASC
+         LIMIT 1`,
+      )
+      .get(normalizedName, currentMint, since) as { mint: string; name: string } | undefined;
+    return row ?? null;
+  }
 }

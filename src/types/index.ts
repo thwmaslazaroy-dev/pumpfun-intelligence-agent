@@ -136,6 +136,16 @@ export interface TokenRepository {
    * Returns true if a new row was inserted, false if an existing row was updated.
    */
   upsertTokenFeedData(token: TokenLaunch): boolean;
+  /**
+   * Return the first token with the same normalizedName (lower-trimmed) inserted
+   * within the past lookbackMs milliseconds, excluding currentMint.
+   * Returns null when no match is found.
+   */
+  findDuplicateTokenName(
+    normalizedName: string,
+    currentMint: string,
+    lookbackMs: number,
+  ): { mint: string; name: string } | null;
 }
 
 export interface CreatorProfile {

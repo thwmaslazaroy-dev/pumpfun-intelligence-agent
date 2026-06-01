@@ -15,7 +15,7 @@ import {
 } from "../scoring";
 import { AlertPolicy, DiscordAlertService } from "../alerts";
 import { PumpFunCoinEnrichmentService } from "../services/pumpfun-coin-enrichment-service";
-import { EnrichmentFilter, FilterCounterDelta, EnrichmentMetricsDelta } from "../services/enrichment-filter";
+import { EnrichmentFilter, FilterCounterDelta, EnrichmentMetricsDelta, normalizeTokenName } from "../services/enrichment-filter";
 
 export interface IngestionResult {
   fetched: number;
@@ -32,6 +32,7 @@ export interface IngestionResult {
   filteredByRuleA: number;
   filteredByRuleB: number;
   filteredByRuleC: number;
+  filteredByRuleD: number;
   sampledUnknownCreators: number;
   // Downstream
   creatorsEvaluated: number;
@@ -59,6 +60,10 @@ export class TokenIngestionJob {
      * using creator history from SQLite before making any API requests.
      */
     private readonly enrichmentFilter?: EnrichmentFilter,
+    private readonly duplicateNameCfg: {
+      enabled: boolean;
+      lookbackHours: number;
+    } = { enabled: false, lookbackHours: 48 },
   ) {}
 
   async runOnce(): Promise<IngestionResult> {
@@ -75,6 +80,7 @@ export class TokenIngestionJob {
       filteredByRuleA: 0,
       filteredByRuleB: 0,
       filteredByRuleC: 0,
+      filteredByRuleD: 0,
       sampledUnknownCreators: 0,
       creatorsEvaluated: 0,
       combinedEvaluations: 0,
@@ -135,6 +141,28 @@ export class TokenIngestionJob {
         name: token.name,
         marketCapUsd: token.initialMarketCapUsd,
       });
+
+      // ── Rule D: duplicate name pre-check ──────────────────────────────────
+      // If the WS fast-path gave us a real name, check for duplicates now
+      // (before enrichment) to avoid a wasted API call.
+      if (this.duplicateNameCfg.enabled) {
+        const normalized = normalizeTokenName(token.name);
+        if (normalized) {
+          const lookbackMs = this.duplicateNameCfg.lookbackHours * 3_600_000;
+          const dup = this.repo.findDuplicateTokenName(normalized, token.mint, lookbackMs);
+          if (dup) {
+            result.filteredByRuleD += 1;
+            logger.info("Rule D: duplicate token name skipped", {
+              mint: token.mint,
+              name: token.name,
+              symbol: token.symbol,
+              normalizedName: normalized,
+              existingMint: dup.mint,
+            });
+            continue;
+          }
+        }
+      }
 
       // ── Pre-enrichment filter ─────────────────────────────────────────────
       // Consults SQLite creator history to skip enrichment API calls for tokens
@@ -197,6 +225,32 @@ export class TokenIngestionJob {
             // Update the stored row: overwrites name/symbol/marketCap/socials/counts
             this.repo.upsertTokenFeedData(enriched);
             tokenForScoring = enriched;
+
+            // ── Rule D: duplicate name post-enrichment check ──────────────
+            // Token was Unknown at detection but now has a real name — check
+            // for duplicates before scoring and alert evaluation.
+            if (this.duplicateNameCfg.enabled) {
+              const normalizedPost = normalizeTokenName(tokenForScoring.name);
+              if (normalizedPost) {
+                const lookbackMs = this.duplicateNameCfg.lookbackHours * 3_600_000;
+                const dup = this.repo.findDuplicateTokenName(
+                  normalizedPost,
+                  tokenForScoring.mint,
+                  lookbackMs,
+                );
+                if (dup) {
+                  result.filteredByRuleD += 1;
+                  logger.info("Rule D: duplicate token name skipped (post-enrichment)", {
+                    mint: tokenForScoring.mint,
+                    name: tokenForScoring.name,
+                    symbol: tokenForScoring.symbol,
+                    normalizedName: normalizedPost,
+                    existingMint: dup.mint,
+                  });
+                  continue;
+                }
+              }
+            }
           } else {
             result.enrichmentFailed += 1;
             logger.warn("ingestion: enrichment failed — scoring on minimal data", {
@@ -322,6 +376,7 @@ export class TokenIngestionJob {
         filteredByRuleA:        result.filteredByRuleA,
         filteredByRuleB:        result.filteredByRuleB,
         filteredByRuleC:        result.filteredByRuleC,
+        filteredByRuleD:        result.filteredByRuleD,
         sampledUnknownCreators: result.sampledUnknownCreators,
         enrichmentsPerformed,
       };

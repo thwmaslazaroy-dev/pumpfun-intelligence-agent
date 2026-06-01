@@ -95,6 +95,7 @@ function main(): void {
     filtered_by_rule_a: number;
     filtered_by_rule_b: number;
     filtered_by_rule_c: number;
+    filtered_by_rule_d: number;
     sampled_unknown_creators: number;
     enrichments_performed: number;
   }
@@ -239,6 +240,7 @@ function main(): void {
   w(`  ${"Sampled unknown creators:"}           ${n6(fs2?.sampled_unknown_creators)}\n`);
   w(`  ${"Skipped by Rule B (score < 50):"}    ${n6(fs2?.filtered_by_rule_b)}\n`);
   w(`  ${"Skipped by Rule C (high-freq bot):"} ${n6(fs2?.filtered_by_rule_c)}\n`);
+  w(`  ${"Skipped by Rule D (duplicate name):"} ${n6(fs2?.filtered_by_rule_d)}\n`);
   w(`  ${"Enrichments attempted:"}             ${n6(fs2?.enrichments_performed)}\n`);
 
   // Section 3: Enrichment outcomes

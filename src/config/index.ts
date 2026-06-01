@@ -74,6 +74,8 @@ export interface AppConfig {
   // Feature flags
   enableTokenEnrichment: boolean;
   enrichUnknownCreatorPercent: number;
+  enableDuplicateNameFilter: boolean;
+  duplicateNameLookbackHours: number;
 }
 
 function read(name: string, fallback = ""): string {
@@ -197,4 +199,6 @@ export const config: AppConfig = {
   cacheMoralisSwapsTtlMs: readInt("CACHE_MORALIS_SWAPS_TTL_MS", 30 * 60 * 1000),  // 30 min
   enableTokenEnrichment: readBool("ENABLE_TOKEN_ENRICHMENT", false),
   enrichUnknownCreatorPercent: readInt("ENRICH_UNKNOWN_CREATOR_PERCENT", 10),
+  enableDuplicateNameFilter: readBool("ENABLE_DUPLICATE_NAME_FILTER", true),
+  duplicateNameLookbackHours: readInt("DUPLICATE_NAME_LOOKBACK_HOURS", 48),
 };

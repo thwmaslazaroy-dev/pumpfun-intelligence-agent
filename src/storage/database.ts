@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tokens (
 
 CREATE INDEX IF NOT EXISTS idx_tokens_launched_at ON tokens(launched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tokens_creator ON tokens(creator_wallet);
+CREATE INDEX IF NOT EXISTS idx_tokens_name_normalized ON tokens(lower(trim(name)), inserted_at);
 
 CREATE TABLE IF NOT EXISTS market_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,6 +221,7 @@ CREATE TABLE IF NOT EXISTS enrichment_filter_stats (
   filtered_by_rule_a INTEGER NOT NULL DEFAULT 0,
   filtered_by_rule_b INTEGER NOT NULL DEFAULT 0,
   filtered_by_rule_c INTEGER NOT NULL DEFAULT 0,
+  filtered_by_rule_d INTEGER NOT NULL DEFAULT 0,
   sampled_unknown_creators INTEGER NOT NULL DEFAULT 0,
   enrichments_performed INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
@@ -251,10 +253,25 @@ export function initDatabase(databaseUrl: string): Database.Database {
   conn.pragma("foreign_keys = ON");
   conn.exec(SCHEMA);
   migrateAlertsTable(conn);
+  migrateEnrichmentFilterStats(conn);
 
   logger.info("database ready", { filePath });
   db = conn;
   return conn;
+}
+
+function migrateEnrichmentFilterStats(conn: Database.Database): void {
+  // conn.exec(SCHEMA) already created the table (CREATE TABLE IF NOT EXISTS).
+  // For existing databases that predate Rule D, add the missing column.
+  const cols = conn
+    .prepare("PRAGMA table_info(enrichment_filter_stats)")
+    .all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "filtered_by_rule_d")) {
+    conn.exec(
+      "ALTER TABLE enrichment_filter_stats ADD COLUMN filtered_by_rule_d INTEGER NOT NULL DEFAULT 0",
+    );
+    logger.info("migration: added enrichment_filter_stats.filtered_by_rule_d column");
+  }
 }
 
 function migrateAlertsTable(conn: Database.Database): void {
