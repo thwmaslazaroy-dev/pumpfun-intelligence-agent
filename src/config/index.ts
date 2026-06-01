@@ -16,9 +16,22 @@ export interface AppConfig {
   ingestionSource: IngestionSource;
   discordWebhookUrl: string;
   discordAlertsEnabled: boolean;
+  alertPreviewOnly: boolean;
   minCombinedAlertScore: number;
   alertCombinedRiskLevels: RiskLevel[];
   alertExtremeRiskEnabled: boolean;
+  // Tier: HIGH_PRIORITY
+  highPriorityAlertsEnabled: boolean;
+  highPriorityMinTokenScore: number;
+  highPriorityMinCombinedScore: number;
+  highPriorityMinCreatorScore: number;
+  // Tier: WATCH_ONLY
+  watchOnlyAlertsEnabled: boolean;
+  watchOnlyMinTokenScore: number;
+  watchOnlyMinCombinedScore: number;
+  watchOnlyMinCreatorScore: number;
+  // Shared alert gate
+  alertMinMarketCapUsd: number;
   solanaRpcWsUrl: string;
   solanaRpcHttpUrl: string;
   solanaRpcHttpUrlBackup: string;
@@ -117,9 +130,19 @@ export const config: AppConfig = {
   ingestionSource: readIngestionSource("INGESTION_SOURCE", "mock"),
   discordWebhookUrl: read("DISCORD_WEBHOOK_URL"),
   discordAlertsEnabled: readBool("DISCORD_ALERTS_ENABLED", false),
+  alertPreviewOnly: readBool("ALERT_PREVIEW_ONLY", true),
   minCombinedAlertScore: readInt("MIN_COMBINED_ALERT_SCORE", 80),
   alertCombinedRiskLevels: readRiskLevels("ALERT_COMBINED_RISK_LEVELS", ["LOW", "MEDIUM"]),
-  alertExtremeRiskEnabled: readBool("ALERT_EXTREME_RISK_ENABLED", true),
+  alertExtremeRiskEnabled: readBool("ALERT_EXTREME_RISK_ENABLED", false),
+  highPriorityAlertsEnabled: readBool("HIGH_PRIORITY_ALERTS_ENABLED", true),
+  highPriorityMinTokenScore: readInt("HIGH_PRIORITY_MIN_TOKEN_SCORE", 85),
+  highPriorityMinCombinedScore: readInt("HIGH_PRIORITY_MIN_COMBINED_SCORE", 75),
+  highPriorityMinCreatorScore: readInt("HIGH_PRIORITY_MIN_CREATOR_SCORE", 60),
+  watchOnlyAlertsEnabled: readBool("WATCH_ONLY_ALERTS_ENABLED", true),
+  watchOnlyMinTokenScore: readInt("WATCH_ONLY_MIN_TOKEN_SCORE", 80),
+  watchOnlyMinCombinedScore: readInt("WATCH_ONLY_MIN_COMBINED_SCORE", 60),
+  watchOnlyMinCreatorScore: readInt("WATCH_ONLY_MIN_CREATOR_SCORE", 50),
+  alertMinMarketCapUsd: readInt("ALERT_MIN_MARKET_CAP_USD", 1500),
   solanaRpcWsUrl: read("SOLANA_RPC_WS_URL"),
   solanaRpcHttpUrl: read("SOLANA_RPC_HTTP_URL"),
   solanaRpcHttpUrlBackup: read("SOLANA_RPC_HTTP_URL_BACKUP"),

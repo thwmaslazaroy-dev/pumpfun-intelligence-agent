@@ -141,6 +141,7 @@ export class TokenIngestionJob {
       // that cannot produce meaningful alerts regardless of their market data.
       let tokenForScoring = token;
       let enrichmentAttempted = false;
+      let wasEnriched = false;
 
       if (this.enrichmentService) {
         let shouldEnrich = true;
@@ -192,6 +193,7 @@ export class TokenIngestionJob {
 
           if (outcome.enriched) {
             result.enriched += 1;
+            wasEnriched = true;
             // Update the stored row: overwrites name/symbol/marketCap/socials/counts
             this.repo.upsertTokenFeedData(enriched);
             tokenForScoring = enriched;
@@ -266,6 +268,7 @@ export class TokenIngestionJob {
           tokenScore,
           creatorScore,
           combined,
+          enriched: wasEnriched,
         });
         if (decision) {
           const alreadySent = await this.repo.hasAlertBeenSent(

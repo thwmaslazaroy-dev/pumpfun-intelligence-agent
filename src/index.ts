@@ -133,7 +133,7 @@ async function main(): Promise<void> {
         "INGESTION_SOURCE=live requires SOLANA_RPC_WS_URL, SOLANA_RPC_HTTP_URL, and PUMPFUN_PROGRAM_ID",
       );
     }
-    logger.info("ingestion source: live (dry-run, Discord alerts disabled)");
+    logger.info("ingestion source: live");
     const parser = new PumpFunTransactionParser(config.pumpfunProgramId);
     const discovery = new LivePumpFunDiscovery({
       wsUrl: config.solanaRpcWsUrl,
@@ -148,18 +148,50 @@ async function main(): Promise<void> {
   } else {
     logger.info("ingestion source: mock");
     provider = new MockPumpFunProvider();
+  }
+
+  // Wire Discord alerts when DISCORD_ALERTS_ENABLED=true (both modes).
+  // ALERT_PREVIEW_ONLY=true (default) logs renders but never POSTs to Discord.
+  // Real sends only happen when ALERT_PREVIEW_ONLY=false AND webhook is set.
+  if (config.discordAlertsEnabled) {
     alertPolicy = new AlertPolicy({
       minCombinedAlertScore: config.minCombinedAlertScore,
       alertCombinedRiskLevels: config.alertCombinedRiskLevels,
       alertExtremeRiskEnabled: config.alertExtremeRiskEnabled,
+      highPriorityAlertsEnabled: config.highPriorityAlertsEnabled,
+      highPriorityMinTokenScore: config.highPriorityMinTokenScore,
+      highPriorityMinCombinedScore: config.highPriorityMinCombinedScore,
+      highPriorityMinCreatorScore: config.highPriorityMinCreatorScore,
+      watchOnlyAlertsEnabled: config.watchOnlyAlertsEnabled,
+      watchOnlyMinTokenScore: config.watchOnlyMinTokenScore,
+      watchOnlyMinCombinedScore: config.watchOnlyMinCombinedScore,
+      watchOnlyMinCreatorScore: config.watchOnlyMinCreatorScore,
+      alertMinMarketCapUsd: config.alertMinMarketCapUsd,
     });
-    alertService = new DiscordAlertService(config.discordWebhookUrl, undefined, { budgetManager: budget });
-    logger.info("alert config", {
+    alertService = new DiscordAlertService(config.discordWebhookUrl, undefined, {
+      budgetManager: budget,
+      previewOnly: config.alertPreviewOnly,
+    });
+    logger.info("discord alerts enabled", {
       webhookConfigured: Boolean(config.discordWebhookUrl),
-      minCombinedAlertScore: config.minCombinedAlertScore,
-      alertCombinedRiskLevels: config.alertCombinedRiskLevels,
-      alertExtremeRiskEnabled: config.alertExtremeRiskEnabled,
+      previewOnly: config.alertPreviewOnly,
+      highPriorityEnabled: config.highPriorityAlertsEnabled,
+      highPriorityThresholds: {
+        token: config.highPriorityMinTokenScore,
+        combined: config.highPriorityMinCombinedScore,
+        creator: config.highPriorityMinCreatorScore,
+      },
+      watchOnlyEnabled: config.watchOnlyAlertsEnabled,
+      watchOnlyThresholds: {
+        token: config.watchOnlyMinTokenScore,
+        combined: config.watchOnlyMinCombinedScore,
+        creator: config.watchOnlyMinCreatorScore,
+      },
+      minMarketCapUsd: config.alertMinMarketCapUsd,
+      extremeRugWarningEnabled: config.alertExtremeRiskEnabled,
     });
+  } else {
+    logger.info("discord alerts disabled (set DISCORD_ALERTS_ENABLED=true to enable)");
   }
 
   const job = new TokenIngestionJob(

@@ -8,9 +8,25 @@ import {
 } from "../types";
 
 export interface AlertPolicyConfig {
+  // ── Legacy fields (kept for backward compat; new code uses tier fields below) ─
   minCombinedAlertScore: number;
   alertCombinedRiskLevels: RiskLevel[];
   alertExtremeRiskEnabled: boolean;
+
+  // ── Tier: HIGH_PRIORITY ───────────────────────────────────────────────────────
+  highPriorityAlertsEnabled: boolean;
+  highPriorityMinTokenScore: number;
+  highPriorityMinCombinedScore: number;
+  highPriorityMinCreatorScore: number;
+
+  // ── Tier: WATCH_ONLY ─────────────────────────────────────────────────────────
+  watchOnlyAlertsEnabled: boolean;
+  watchOnlyMinTokenScore: number;
+  watchOnlyMinCombinedScore: number;
+  watchOnlyMinCreatorScore: number;
+
+  // ── Shared gate ───────────────────────────────────────────────────────────────
+  alertMinMarketCapUsd: number;
 }
 
 export interface AlertContext {
@@ -18,6 +34,8 @@ export interface AlertContext {
   tokenScore: TokenScore;
   creatorScore: CreatorScore;
   combined: CombinedTokenEvaluation;
+  /** True when the token was successfully enriched this ingestion cycle. */
+  enriched: boolean;
 }
 
 export interface AlertDecision {
@@ -30,22 +48,64 @@ export class AlertPolicy {
   constructor(private readonly cfg: AlertPolicyConfig) {}
 
   evaluate(ctx: AlertContext): AlertDecision | null {
-    if (this.cfg.alertExtremeRiskEnabled && ctx.combined.combinedRiskLevel === "EXTREME") {
+    const { token, tokenScore, creatorScore, combined } = ctx;
+
+    // ── Legacy: EXTREME rug warning (disabled unless explicitly enabled) ─────────
+    if (this.cfg.alertExtremeRiskEnabled && combined.combinedRiskLevel === "EXTREME") {
       return {
         alertType: "warning",
         context: ctx,
-        reason: `combined risk EXTREME (combinedScore=${ctx.combined.combinedScore})`,
+        reason: `combined risk EXTREME (combinedScore=${combined.combinedScore})`,
       };
     }
 
+    // ── Both new tiers: require enrichment and minimum market cap ────────────────
+    if (!ctx.enriched || token.initialMarketCapUsd < this.cfg.alertMinMarketCapUsd) {
+      return null;
+    }
+
+    // Both tiers require LOW or MEDIUM combined risk
+    if (combined.combinedRiskLevel === "HIGH" || combined.combinedRiskLevel === "EXTREME") {
+      return null;
+    }
+
+    // ── Tier: HIGH_PRIORITY (checked first — higher bar) ─────────────────────────
     if (
-      ctx.combined.combinedScore >= this.cfg.minCombinedAlertScore &&
-      this.cfg.alertCombinedRiskLevels.includes(ctx.combined.combinedRiskLevel)
+      this.cfg.highPriorityAlertsEnabled &&
+      tokenScore.totalScore >= this.cfg.highPriorityMinTokenScore &&
+      combined.combinedScore >= this.cfg.highPriorityMinCombinedScore &&
+      creatorScore.totalScore >= this.cfg.highPriorityMinCreatorScore
     ) {
       return {
-        alertType: "opportunity",
+        alertType: "HIGH_PRIORITY",
         context: ctx,
-        reason: `combinedScore ${ctx.combined.combinedScore} >= ${this.cfg.minCombinedAlertScore} and risk ${ctx.combined.combinedRiskLevel} in [${this.cfg.alertCombinedRiskLevels.join(",")}]`,
+        reason: [
+          `tokenScore=${tokenScore.totalScore}`,
+          `combinedScore=${combined.combinedScore}`,
+          `creatorScore=${creatorScore.totalScore}`,
+          `marketCap=$${token.initialMarketCapUsd.toFixed(0)}`,
+          `risk=${combined.combinedRiskLevel}`,
+        ].join(" "),
+      };
+    }
+
+    // ── Tier: WATCH_ONLY ─────────────────────────────────────────────────────────
+    if (
+      this.cfg.watchOnlyAlertsEnabled &&
+      tokenScore.totalScore >= this.cfg.watchOnlyMinTokenScore &&
+      combined.combinedScore >= this.cfg.watchOnlyMinCombinedScore &&
+      creatorScore.totalScore >= this.cfg.watchOnlyMinCreatorScore
+    ) {
+      return {
+        alertType: "WATCH_ONLY",
+        context: ctx,
+        reason: [
+          `tokenScore=${tokenScore.totalScore}`,
+          `combinedScore=${combined.combinedScore}`,
+          `creatorScore=${creatorScore.totalScore}`,
+          `marketCap=$${token.initialMarketCapUsd.toFixed(0)}`,
+          `risk=${combined.combinedRiskLevel}`,
+        ].join(" "),
       };
     }
 

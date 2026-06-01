@@ -45,7 +45,7 @@ export interface TokenRiskFlags {
 
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "EXTREME";
 
-export type AlertType = "opportunity" | "warning" | "momentum";
+export type AlertType = "opportunity" | "warning" | "momentum" | "WATCH_ONLY" | "HIGH_PRIORITY";
 
 export type PumpFunTransactionKind = "CREATE" | "BUY" | "SELL" | "ATA_CREATE" | "UNKNOWN";
 
