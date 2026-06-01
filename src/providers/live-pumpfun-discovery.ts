@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import WebSocket, { RawData } from "ws";
 import { logger } from "../utils/logger";
 import {
@@ -53,6 +54,14 @@ export interface LiveDiscoveryCounters {
   // Cheap pre-filter on the WS notification's own logs — skips getTransaction
   // entirely for buys/sells/ATA creates etc. Only CREATE-marker logs survive.
   prefilterIgnoredLogs: number;
+  // WS fast-path: CreateEvent decoded directly from Program data log (no HTTP).
+  wsFastPath: number;
+  // Create marker present but Program data could not be decoded — fell through to HTTP.
+  wsFastPathMisses: number;
+  // Total getTransaction HTTP calls initiated (budget-blocked calls excluded).
+  rpcAttempted: number;
+  // Budget blocked getTransaction — signature dropped.
+  droppedDueBudget: number;
 }
 
 type ErrorCategory =
@@ -102,6 +111,26 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const STOP_CLEANUP_FALLBACK_MS = 2_000;
 
+// ── WS fast-path: decode CreateEvent from Program data log ───────────────────
+// Pump.fun emits a Borsh-encoded CreateEvent in a "Program data: <base64>" log
+// line for every token launch.  We decode it directly from the WS notification
+// so the common case never needs a getTransaction HTTP call.
+
+const BASE58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+// sha256("event:CreateEvent")[0..8] — anchor event discriminant
+const CREATE_EVENT_DISC: Uint8Array = createHash("sha256")
+  .update("event:CreateEvent")
+  .digest()
+  .subarray(0, 8);
+
+interface WsFastPathResult {
+  mint: string;
+  name: string;
+  symbol: string;
+  creatorWallet: string;
+}
+
 export class LivePumpFunDiscovery {
   private readonly cfg: Required<Omit<LivePumpFunDiscoveryConfig, "budgetManager">> & {
     budgetManager?: RequestBudgetManager;
@@ -148,6 +177,10 @@ export class LivePumpFunDiscovery {
     duplicateSignatures: 0,
     droppedDueToBackpressure: 0,
     prefilterIgnoredLogs: 0,
+    wsFastPath: 0,
+    wsFastPathMisses: 0,
+    rpcAttempted: 0,
+    droppedDueBudget: 0,
   };
 
   constructor(cfg: LivePumpFunDiscoveryConfig) {
@@ -407,6 +440,17 @@ export class LivePumpFunDiscovery {
         return;
       }
 
+      // WS fast path: decode CreateEvent Borsh data from the Program data log
+      // and emit a CREATE event without any getTransaction HTTP call.
+      const fast = tryExtractCreateFromWsLogs(logs);
+      if (fast) {
+        this.counters.wsFastPath += 1;
+        void this.processFastPathCreate(fast, signature, slot);
+        return;
+      }
+
+      // Fast path miss (Program data absent or malformed) — fall through to HTTP.
+      this.counters.wsFastPathMisses += 1;
       this.enqueue(signature, slot);
     }
   }
@@ -452,6 +496,71 @@ export class LivePumpFunDiscovery {
     void this.processNotification(next.signature, next.slot);
   }
 
+  private async processFastPathCreate(
+    fast: WsFastPathResult,
+    signature: string,
+    slot: number | null,
+  ): Promise<void> {
+    if (this.stopRequested) return;
+
+    // In-memory dedup — fast path bypasses enqueue() so we manage the set here.
+    if (this.seenSignatures.has(signature)) {
+      this.counters.duplicateSignatures += 1;
+      return;
+    }
+    this.seenSignatures.add(signature);
+    this.seenSignaturesOrder.push(signature);
+    if (this.seenSignaturesOrder.length > MAX_SEEN_SIGNATURES) {
+      const evicted = this.seenSignaturesOrder.shift();
+      if (evicted !== undefined) this.seenSignatures.delete(evicted);
+    }
+
+    const budget = this.cfg.budgetManager;
+    // Cross-session dedup via SQLite.
+    if (budget?.hasProcessedSignature(signature)) {
+      this.counters.duplicateSignatures += 1;
+      return;
+    }
+
+    this.counters.createDetections += 1;
+    this.lastCreateSignature = signature;
+    budget?.markSignatureProcessed(signature, "CREATE");
+
+    const parsed: ParsedPumpFunTransaction = {
+      signature,
+      slot,
+      blockTime: null,
+      kind: "CREATE",
+      confidence: "HIGH",
+      candidateMints: [fast.mint],
+      candidateWallets: [fast.creatorWallet],
+      involvedPrograms: [this.cfg.programId],
+      pumpfunProgramSeen: true,
+      logMessages: [],
+      reasons: ["ws-fast-path: CreateEvent decoded from Program data log (no HTTP)"],
+    };
+
+    try {
+      if (this.onCreate) {
+        await this.onCreate({
+          parsed,
+          observedAt: new Date().toISOString(),
+          receivedFromLog: { signature, slot },
+          creatorWallet: fast.creatorWallet,
+          creatorExtractionReason:
+            "CreateEvent.user decoded from Program data log (no getTransaction call)",
+        });
+      }
+    } catch (err) {
+      this.counters.unknownErrors += 1;
+      this.maybeLogErrorSample(
+        "unknown",
+        err instanceof Error ? err.message : String(err),
+        { signature, where: "onCreateFastPath" },
+      );
+    }
+  }
+
   private async processNotification(
     signature: string,
     slot: number | null,
@@ -468,6 +577,7 @@ export class LivePumpFunDiscovery {
     if (budget) {
       const check = budget.allowRequest("helius_http", "CRITICAL");
       if (!check.allowed) {
+        this.counters.droppedDueBudget += 1;
         logger.warn("budget: helius_http blocked getTransaction", {
           reason: check.reason,
           dayUsagePct: check.dayUsagePct.toFixed(1),
@@ -477,6 +587,7 @@ export class LivePumpFunDiscovery {
       }
     }
 
+    this.counters.rpcAttempted += 1;
     let txResult: unknown = null;
     try {
       const res = await this.rpcGetTransaction(signature);
@@ -690,6 +801,80 @@ export class LivePumpFunDiscovery {
       throttleMs: ERROR_SAMPLE_THROTTLE_MS,
     });
   }
+}
+
+// ── WS fast-path helpers ─────────────────────────────────────────────────────
+
+function base58Encode(bytes: Uint8Array): string {
+  let num = 0n;
+  for (const byte of bytes) num = num * 256n + BigInt(byte);
+  let result = "";
+  while (num > 0n) {
+    result = BASE58_CHARS[Number(num % 58n)] + result;
+    num /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    result = "1" + result;
+  }
+  return result;
+}
+
+/**
+ * Attempt to decode a Pump.fun CreateEvent from the "Program data: <base64>"
+ * log lines in a WS logsNotification frame.
+ *
+ * Borsh layout after the 8-byte anchor discriminant:
+ *   name:         string (u32 len + utf8 bytes)
+ *   symbol:       string (u32 len + utf8 bytes)
+ *   uri:          string (u32 len + utf8 bytes)
+ *   mint:         Pubkey (32 bytes)
+ *   bondingCurve: Pubkey (32 bytes)
+ *   user:         Pubkey (32 bytes)   ← creator wallet
+ *
+ * Returns null if no parseable CreateEvent is found.
+ */
+function tryExtractCreateFromWsLogs(logs: string[]): WsFastPathResult | null {
+  for (const line of logs) {
+    if (!line.startsWith("Program data: ")) continue;
+    const b64 = line.slice("Program data: ".length).trim();
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(b64, "base64");
+    } catch {
+      continue;
+    }
+    if (buf.length < 8) continue;
+    // Check anchor discriminant
+    let discMatch = true;
+    for (let i = 0; i < 8; i++) {
+      if (buf[i] !== CREATE_EVENT_DISC[i]) { discMatch = false; break; }
+    }
+    if (!discMatch) continue;
+    try {
+      let offset = 8;
+      const nameLen = buf.readUInt32LE(offset); offset += 4;
+      if (nameLen > 200 || offset + nameLen > buf.length) continue;
+      const name = buf.subarray(offset, offset + nameLen).toString("utf8"); offset += nameLen;
+      const symbolLen = buf.readUInt32LE(offset); offset += 4;
+      if (symbolLen > 50 || offset + symbolLen > buf.length) continue;
+      const symbol = buf.subarray(offset, offset + symbolLen).toString("utf8"); offset += symbolLen;
+      const uriLen = buf.readUInt32LE(offset); offset += 4;
+      if (uriLen > 500 || offset + uriLen > buf.length) continue;
+      offset += uriLen;
+      // Need: mint(32) + bondingCurve(32) + user/creator(32) = 96 bytes
+      if (offset + 96 > buf.length) continue;
+      const mint = base58Encode(buf.subarray(offset, offset + 32)); offset += 32;
+      offset += 32; // skip bondingCurve
+      const creatorWallet = base58Encode(buf.subarray(offset, offset + 32));
+      // Sanity check: Solana base58 pubkeys are always ≥32 characters
+      if (mint.length < 20 || creatorWallet.length < 20) continue;
+      return { mint, name, symbol, creatorWallet };
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 function isRateLimitText(s: string): boolean {
