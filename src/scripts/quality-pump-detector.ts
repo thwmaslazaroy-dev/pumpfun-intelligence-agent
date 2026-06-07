@@ -11,9 +11,10 @@ const TOKEN_MAX_AGE_MS = 45 * 60 * 1000; // forget tokens older than 45min
 const MIN_TOKEN_AGE_MIN = 3;
 const MAX_TOKEN_AGE_MIN = 25;
 
-// Market cap range (USD) — early but not too early
-const MIN_MARKET_CAP_USD = 6_000;
-const MAX_MARKET_CAP_USD = 80_000;
+// Early trade volume (SOL) — approximates a $15k-$20k market cap filter,
+// since market cap isn't derivable from the WebSocket feed
+const MIN_EARLY_VOLUME_SOL = 15;
+const EARLY_VOLUME_WINDOW_MS = 20 * 60 * 1000;
 
 // Quality thresholds
 const MIN_UNIQUE_BUYERS = 20;            // at least 20 different wallets
@@ -27,6 +28,9 @@ const MIN_SCORE = 65;
 
 // Max alerts per hour (spam protection)
 const MAX_ALERTS_PER_HOUR = 8;
+
+// Duplicate name/symbol filter — skip re-launches of already-seen tickers
+const DUPLICATE_NAME_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
 // ── Anchor discriminants ──────────────────────────────────────────────────────
 const CREATE_EVENT_DISC = createHash("sha256")
@@ -63,6 +67,10 @@ interface TokenState {
 const tokens = new Map<string, TokenState>();
 const alerted = new Set<string>();
 const alertTimestamps: number[] = [];
+
+// Lower-cased name/symbol → first-seen timestamp (for duplicate detection + 48h expiry)
+const seenNames = new Map<string, number>();
+const seenSymbols = new Map<string, number>();
 
 let currentWs: WebSocket | null = null;
 let rawMessages = 0;
@@ -155,6 +163,16 @@ function detectEventType(logs: string[]): "create" | "buy" | "sell" | null {
     if (/Program log:\s*Instruction:\s*(Sell|SellExact)/i.test(line)) return "sell";
   }
   return null;
+}
+
+// Total SOL traded (buys + sells) within the token's first 20 minutes of life
+function earlyVolumeSol(state: TokenState): number {
+  const windowEnd = state.firstSeenAt + EARLY_VOLUME_WINDOW_MS;
+  let total = 0;
+  for (const t of state.trades) {
+    if (t.ts <= windowEnd) total += t.solAmount;
+  }
+  return total;
 }
 
 // ── Quality Scoring ───────────────────────────────────────────────────────────
@@ -336,6 +354,14 @@ async function evaluate(): Promise<void> {
     alertTimestamps.shift();
   }
 
+  // Cleanup seen names/symbols older than 48h
+  for (const [key, ts] of seenNames) {
+    if (now - ts > DUPLICATE_NAME_MAX_AGE_MS) seenNames.delete(key);
+  }
+  for (const [key, ts] of seenSymbols) {
+    if (now - ts > DUPLICATE_NAME_MAX_AGE_MS) seenSymbols.delete(key);
+  }
+
   let sent = 0;
   let candidates = 0;
 
@@ -344,6 +370,8 @@ async function evaluate(): Promise<void> {
 
     const ageMin = (now - state.firstSeenAt) / 60_000;
     if (ageMin < MIN_TOKEN_AGE_MIN || ageMin > MAX_TOKEN_AGE_MIN) continue;
+
+    if (earlyVolumeSol(state) < MIN_EARLY_VOLUME_SOL) continue;
 
     // Quick pre-filter before scoring
     const recentBuys = state.trades.filter(
@@ -395,9 +423,22 @@ async function evaluate(): Promise<void> {
 // ── Event handlers ────────────────────────────────────────────────────────────
 function handleCreate(mint: string, name: string, symbol: string, creator: string): void {
   if (tokens.has(mint)) return;
+
+  const now = Date.now();
+  const nameKey = name.trim().toLowerCase();
+  const symbolKey = symbol.trim().toLowerCase();
+
+  if ((nameKey && seenNames.has(nameKey)) || (symbolKey && seenSymbols.has(symbolKey))) {
+    log("[DUPLICATE]", { mint: mint.slice(0, 8) + "…", name, symbol });
+    return;
+  }
+
+  if (nameKey) seenNames.set(nameKey, now);
+  if (symbolKey) seenSymbols.set(symbolKey, now);
+
   tokens.set(mint, {
     mint, name, symbol, creator,
-    firstSeenAt: Date.now(),
+    firstSeenAt: now,
     trades: [],
     creatorSoldAt: null,
   });
