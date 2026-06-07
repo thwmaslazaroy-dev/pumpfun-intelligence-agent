@@ -23,12 +23,12 @@ const MIN_AGE_MIN = 20;
 const MAX_AGE_MIN = 90;
 
 // Survivor thresholds
-const MIN_MARKET_CAP_USD = 15_000;       // current MC floor
+const MIN_MARKET_CAP_USD = 5_000;        // current MC floor
 const MAX_DRAWDOWN_FROM_ATH = 0.40;      // current MC must be >= 60% of ATH
 const MIN_SNAPSHOTS = 8;                 // at least 8 observations on record
-const BEST_RANK_EVER_MAX = 5;            // must have hit top-5 rank at some point
-const CURRENT_RANK_MAX = 15;             // still ranked reasonably now
-const MIN_MC_GROWTH_FROM_FIRST = 0.80;   // +80% growth from first observed snapshot
+const BEST_RANK_EVER_MAX = 8;            // must have hit top-8 rank at some point
+const CURRENT_RANK_MAX = 25;             // still ranked reasonably now
+const MIN_MC_GROWTH_FROM_FIRST = 0.50;   // +50% growth from first observed snapshot
 
 // Duplicate name/symbol filter
 const DUPLICATE_NAME_WINDOW_MS = 48 * 60 * 60 * 1000;
