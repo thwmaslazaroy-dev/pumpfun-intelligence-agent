@@ -47,6 +47,11 @@ function log(msg, extra) {
   process.stdout.write(`[${new Date().toISOString()}] ${line}\n`);
 }
 
+// Debug aid for threshold tuning: logs which specific check eliminated a candidate
+function logRejected(mint, name, reason, detail) {
+  log("[REJECTED]", { mint: mint.slice(0, 8) + "…", name, reason, ...detail });
+}
+
 // ── Database ──────────────────────────────────────────────────────────────────
 if (!fs.existsSync(DB_PATH)) {
   log(`ERROR: database file not found: ${DB_PATH}`);
@@ -172,22 +177,56 @@ async function evaluate() {
     if (!latest) continue;
 
     const ageMin = (now - latest.created_timestamp_ms) / 60_000;
-    if (ageMin < MIN_AGE_MIN || ageMin > MAX_AGE_MIN) continue;
+    if (ageMin < MIN_AGE_MIN || ageMin > MAX_AGE_MIN) {
+      logRejected(mint, latest.name, "age", { ageMin: ageMin.toFixed(1) });
+      continue;
+    }
 
-    if (latest.complete !== 0) continue;
-    if (latest.market_cap_usd < MIN_MARKET_CAP_USD) continue;
-    if (!latest.ath_market_cap || latest.ath_market_cap <= 0) continue;
-    if (latest.market_cap_usd < latest.ath_market_cap * (1 - MAX_DRAWDOWN_FROM_ATH)) continue;
-    if (latest.recommendation_rank == null || latest.recommendation_rank > CURRENT_RANK_MAX) continue;
+    if (latest.complete !== 0) {
+      logRejected(mint, latest.name, "complete", { complete: latest.complete });
+      continue;
+    }
+    if (latest.market_cap_usd < MIN_MARKET_CAP_USD) {
+      logRejected(mint, latest.name, "mc", { marketCapUsd: latest.market_cap_usd, minRequired: MIN_MARKET_CAP_USD });
+      continue;
+    }
+    if (!latest.ath_market_cap || latest.ath_market_cap <= 0
+      || latest.market_cap_usd < latest.ath_market_cap * (1 - MAX_DRAWDOWN_FROM_ATH)) {
+      const drawdownPct = latest.ath_market_cap > 0
+        ? ((1 - latest.market_cap_usd / latest.ath_market_cap) * 100).toFixed(0)
+        : null;
+      logRejected(mint, latest.name, "drawdown", {
+        marketCapUsd: latest.market_cap_usd,
+        athMarketCap: latest.ath_market_cap,
+        drawdownPct,
+      });
+      continue;
+    }
+    if (latest.recommendation_rank == null || latest.recommendation_rank > CURRENT_RANK_MAX) {
+      logRejected(mint, latest.name, "rank", { currentRank: latest.recommendation_rank, maxAllowed: CURRENT_RANK_MAX });
+      continue;
+    }
 
     const stats = snapshotStatsStmt.get(mint);
-    if (!stats || stats.count < MIN_SNAPSHOTS) continue;
-    if (stats.bestRank == null || stats.bestRank > BEST_RANK_EVER_MAX) continue;
+    if (!stats || stats.count < MIN_SNAPSHOTS) {
+      logRejected(mint, latest.name, "snapshots", { count: stats ? stats.count : 0, minRequired: MIN_SNAPSHOTS });
+      continue;
+    }
+    if (stats.bestRank == null || stats.bestRank > BEST_RANK_EVER_MAX) {
+      logRejected(mint, latest.name, "rank", { bestRankEver: stats.bestRank, maxAllowed: BEST_RANK_EVER_MAX });
+      continue;
+    }
 
     const first = firstSnapshotStmt.get(mint);
-    if (!first || first.market_cap_usd <= 0) continue;
+    if (!first || first.market_cap_usd <= 0) {
+      logRejected(mint, latest.name, "growth", { firstMarketCapUsd: first ? first.market_cap_usd : null });
+      continue;
+    }
     const growth = (latest.market_cap_usd - first.market_cap_usd) / first.market_cap_usd;
-    if (growth < MIN_MC_GROWTH_FROM_FIRST) continue;
+    if (growth < MIN_MC_GROWTH_FROM_FIRST) {
+      logRejected(mint, latest.name, "growth", { growthPct: (growth * 100).toFixed(0), minRequiredPct: MIN_MC_GROWTH_FROM_FIRST * 100 });
+      continue;
+    }
 
     const nameKey = (latest.name || "").trim().toLowerCase();
     const symbolKey = (latest.symbol || "").trim().toLowerCase();
